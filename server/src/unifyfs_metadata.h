@@ -40,13 +40,13 @@
  */
 typedef struct {
     /** global file id */
-    int fid;
+    int gfid;
     /** logical file offset */
     size_t offset;
 } unifyfs_key_t;
 
 #define UNIFYFS_KEY_SZ (sizeof(unifyfs_key_t))
-#define UNIFYFS_KEY_FID(keyp) (((unifyfs_key_t*)keyp)->fid)
+#define UNIFYFS_KEY_FID(keyp) (((unifyfs_key_t*)keyp)->gfid)
 #define UNIFYFS_KEY_OFF(keyp) (((unifyfs_key_t*)keyp)->offset)
 
 typedef struct {
@@ -79,11 +79,7 @@ void debug_log_key_val(const char* ctx,
 
 int meta_sanitize(void);
 int meta_init_store(unifyfs_cfg_t* cfg);
-void print_bget_indices(int app_id, int client_id,
-                        send_msg_t* index_set, int tot_num);
 
-int meta_init_indices(void);
-void meta_free_indices(void);
 void print_fsync_indices(unifyfs_key_t** unifyfs_keys,
                          unifyfs_val_t** unifyfs_vals, size_t num_entries);
 
@@ -98,12 +94,25 @@ int unifyfs_get_file_attribute(int gfid,
                                unifyfs_file_attr_t* ptr_attr_val);
 
 /**
+ * Delete file attribute from the KV-Store.
+ *
+ * @param [in] gfid
+ * @return UNIFYFS_SUCCESS on success
+ */
+int unifyfs_delete_file_attribute(int gfid);
+
+/**
  * Store a File attribute to the KV-Store.
  *
+ * @param[in] size_flag
+ * @param[in] laminate_flag
  * @param[in] *ptr_attr_val
  * @return UNIFYFS_SUCCESS on success
  */
-int unifyfs_set_file_attribute(unifyfs_file_attr_t* ptr_attr_val);
+int unifyfs_set_file_attribute(
+    int size_flag,
+    int laminate_flag,
+    unifyfs_file_attr_t* ptr_attr_val);
 
 /**
  * Store File attributes to the KV-Store.
@@ -131,6 +140,16 @@ int unifyfs_set_file_attributes(int num_entries,
 int unifyfs_get_file_extents(int num_keys,
                              unifyfs_key_t** keys, int* key_lens,
                              int* num_values, unifyfs_keyval_t** keyval);
+
+/**
+ * Delete File extents from the KV-Store.
+ *
+ * @param[in] num_entries number of key value pairs to delete
+ * @param[in] keys array storing the keys
+ * @param[in] key_lens array with the length of the elements in \p keys
+ */
+int unifyfs_delete_file_extents(int num_entries,
+                                unifyfs_key_t** keys, int* key_lens);
 
 /**
  * Store File extents in the KV-Store.

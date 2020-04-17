@@ -30,7 +30,6 @@
 // system headers
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <mpi.h>
 
 // server components
 #include "unifyfs_global.h"
@@ -142,8 +141,7 @@ static int open_log_file(app_config_t* app_config,
     /* open spill over file for reading */
     app_config->spill_log_fds[client_side_id] = open(path, O_RDONLY, 0666);
     if (app_config->spill_log_fds[client_side_id] < 0) {
-        printf("rank:%d, opening file %s failure\n", glb_mpi_rank, path);
-        fflush(stdout);
+        LOGERR("failed to open spill file %s", path);
         return (int)UNIFYFS_ERROR_FILE;
     }
 
@@ -160,8 +158,7 @@ static int open_log_file(app_config_t* app_config,
     app_config->spill_index_log_fds[client_side_id] =
         open(path, O_RDONLY, 0666);
     if (app_config->spill_index_log_fds[client_side_id] < 0) {
-        printf("rank:%d, opening index file %s failure\n", glb_mpi_rank, path);
-        fflush(stdout);
+        LOGERR("failed to open spill index file %s", path);
         return (int)UNIFYFS_ERROR_FILE;
     }
 
@@ -216,10 +213,6 @@ static void unifyfs_mount_rpc(hg_handle_t handle)
         /* record offset and size of index entries */
         tmp_config->meta_offset = in.meta_offset;
         tmp_config->meta_size   = in.meta_size;
-
-        /* record offset and size of file meta data entries */
-        tmp_config->fmeta_offset = in.fmeta_offset;
-        tmp_config->fmeta_size   = in.fmeta_size;
 
         /* record offset and size of file data */
         tmp_config->data_offset = in.data_offset;
@@ -377,22 +370,21 @@ static void unifyfs_metaget_rpc(hg_handle_t handle)
     /* given the global file id, look up file attributes
      * from key/value store */
     unifyfs_file_attr_t attr_val;
-
     int ret = unifyfs_get_file_attribute(in.gfid, &attr_val);
 
     /* build our output values */
     unifyfs_metaget_out_t out;
-    out.gfid = attr_val.gfid;
-    out.mode = attr_val.mode;
-    out.uid = attr_val.uid;
-    out.gid = attr_val.gid;
-    out.size = attr_val.size;
-    out.atime = attr_val.atime;
-    out.mtime = attr_val.mtime;
-    out.ctime = attr_val.ctime;
-    out.filename = attr_val.filename;
+    out.gfid         = attr_val.gfid;
+    out.mode         = attr_val.mode;
+    out.uid          = attr_val.uid;
+    out.gid          = attr_val.gid;
+    out.size         = attr_val.size;
+    out.atime        = attr_val.atime;
+    out.mtime        = attr_val.mtime;
+    out.ctime        = attr_val.ctime;
+    out.filename     = attr_val.filename;
     out.is_laminated = attr_val.is_laminated;
-    out.ret = ret;
+    out.ret          = ret;
 
     /* send output back to caller */
     hret = margo_respond(handle, &out);
@@ -416,18 +408,21 @@ static void unifyfs_metaset_rpc(hg_handle_t handle)
     /* store file name for given global file id */
     unifyfs_file_attr_t fattr;
     memset(&fattr, 0, sizeof(fattr));
-    fattr.gfid = in.gfid;
+    int create         = (int) in.create;
+    fattr.gfid         = in.gfid;
     strncpy(fattr.filename, in.filename, sizeof(fattr.filename));
-    fattr.mode = in.mode;
-    fattr.uid = in.uid;
-    fattr.gid = in.gid;
-    fattr.size = in.size;
-    fattr.atime = in.atime;
-    fattr.mtime = in.mtime;
-    fattr.ctime = in.ctime;
+    fattr.mode         = in.mode;
+    fattr.uid          = in.uid;
+    fattr.gid          = in.gid;
+    fattr.size         = in.size;
+    fattr.atime        = in.atime;
+    fattr.mtime        = in.mtime;
+    fattr.ctime        = in.ctime;
     fattr.is_laminated = in.is_laminated;
 
-    int ret = unifyfs_set_file_attribute(&fattr);
+    /* if we're creating the file,
+     * we initialize both the size and laminate flags */
+    int ret = unifyfs_set_file_attribute(create, create, &fattr);
 
     /* build our output values */
     unifyfs_metaset_out_t out;
@@ -483,7 +478,7 @@ static void unifyfs_filesize_rpc(hg_handle_t handle)
 
     /* read data for a single read request from client,
      * returns data to client through shared memory */
-    size_t filesize;
+    size_t filesize = 0;
     int ret = rm_cmd_filesize(in.app_id, in.local_rank_idx,
                               in.gfid, &filesize);
 
@@ -501,6 +496,85 @@ static void unifyfs_filesize_rpc(hg_handle_t handle)
     margo_destroy(handle);
 }
 DEFINE_MARGO_RPC_HANDLER(unifyfs_filesize_rpc)
+
+/* given an app_id, client_id, global file id,
+ * and file size, truncate file to that size */
+static void unifyfs_truncate_rpc(hg_handle_t handle)
+{
+    /* get input params */
+    unifyfs_truncate_in_t in;
+    hg_return_t hret = margo_get_input(handle, &in);
+    assert(hret == HG_SUCCESS);
+
+    /* truncate file to specified size */
+    int ret = rm_cmd_truncate(in.app_id, in.local_rank_idx,
+                              in.gfid, in.filesize);
+
+    /* build our output values */
+    unifyfs_truncate_out_t out;
+    out.ret = (int32_t) ret;
+
+    /* return to caller */
+    hret = margo_respond(handle, &out);
+    assert(hret == HG_SUCCESS);
+
+    /* free margo resources */
+    margo_free_input(handle, &in);
+    margo_destroy(handle);
+}
+DEFINE_MARGO_RPC_HANDLER(unifyfs_truncate_rpc)
+
+/* given an app_id, client_id, and global file id,
+ * remove file from system */
+static void unifyfs_unlink_rpc(hg_handle_t handle)
+{
+    /* get input params */
+    unifyfs_truncate_in_t in;
+    hg_return_t hret = margo_get_input(handle, &in);
+    assert(hret == HG_SUCCESS);
+
+    /* truncate file to specified size */
+    int ret = rm_cmd_unlink(in.app_id, in.local_rank_idx, in.gfid);
+
+    /* build our output values */
+    unifyfs_truncate_out_t out;
+    out.ret = (int32_t) ret;
+
+    /* return to caller */
+    hret = margo_respond(handle, &out);
+    assert(hret == HG_SUCCESS);
+
+    /* free margo resources */
+    margo_free_input(handle, &in);
+    margo_destroy(handle);
+}
+DEFINE_MARGO_RPC_HANDLER(unifyfs_unlink_rpc)
+
+/* given an app_id, client_id, and global file id,
+ * laminate file */
+static void unifyfs_laminate_rpc(hg_handle_t handle)
+{
+    /* get input params */
+    unifyfs_truncate_in_t in;
+    hg_return_t hret = margo_get_input(handle, &in);
+    assert(hret == HG_SUCCESS);
+
+    /* truncate file to specified size */
+    int ret = rm_cmd_laminate(in.app_id, in.local_rank_idx, in.gfid);
+
+    /* build our output values */
+    unifyfs_truncate_out_t out;
+    out.ret = (int32_t) ret;
+
+    /* return to caller */
+    hret = margo_respond(handle, &out);
+    assert(hret == HG_SUCCESS);
+
+    /* free margo resources */
+    margo_free_input(handle, &in);
+    margo_destroy(handle);
+}
+DEFINE_MARGO_RPC_HANDLER(unifyfs_laminate_rpc)
 
 /* given an app_id, client_id, global file id, an offset, and a length,
  * initiate read operation to lookup and return data,

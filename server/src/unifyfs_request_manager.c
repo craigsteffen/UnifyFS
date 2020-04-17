@@ -33,7 +33,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
-#include <mpi.h>
 
 // general support
 #include "unifyfs_global.h"
@@ -108,43 +107,6 @@ reqmgr_thrd_t* unifyfs_rm_thrd_create(int app_id, int client_id)
         return NULL;
     }
 
-    /* allocate an array for listing read requests from client */
-    thrd_ctrl->del_req_set = (msg_meta_t*)calloc(1, sizeof(msg_meta_t));
-    if (thrd_ctrl->del_req_set == NULL) {
-        LOGERR("Failed to allocate read request structure for request "
-               "manager thread for app_id=%d client_id=%d",
-               app_id, client_id);
-        free(thrd_ctrl);
-        return NULL;
-    }
-
-    /* allocate structure for tracking outstanding read requests
-     * this delegator has with service managers on other nodes */
-    thrd_ctrl->del_req_stat = (del_req_stat_t*)
-        calloc(1, sizeof(del_req_stat_t));
-    if (thrd_ctrl->del_req_stat == NULL) {
-        LOGERR("Failed to allocate delegator structure for request "
-               "manager thread for app_id=%d client_id=%d",
-               app_id, client_id);
-        free(thrd_ctrl->del_req_set);
-        free(thrd_ctrl);
-        return NULL;
-    }
-
-    /* allocate a structure to track requests we have on each
-     * remote service manager */
-    thrd_ctrl->del_req_stat->req_stat = (per_del_stat_t*)
-        calloc(glb_mpi_size, sizeof(per_del_stat_t));
-    if (thrd_ctrl->del_req_stat->req_stat == NULL) {
-        LOGERR("Failed to allocate per-delegator structure for request "
-               "manager thread for app_id=%d client_id=%d",
-               app_id, client_id);
-        free(thrd_ctrl->del_req_stat);
-        free(thrd_ctrl->del_req_set);
-        free(thrd_ctrl);
-        return NULL;
-    }
-
     /* initialize lock for shared data structures between
      * main thread and request delegator thread */
     pthread_mutexattr_t attr;
@@ -155,9 +117,6 @@ reqmgr_thrd_t* unifyfs_rm_thrd_create(int app_id, int client_id)
         LOGERR("pthread_mutex_init failed for request "
                "manager thread app_id=%d client_id=%d rc=%d (%s)",
                app_id, client_id, rc, strerror(rc));
-        free(thrd_ctrl->del_req_stat->req_stat);
-        free(thrd_ctrl->del_req_stat);
-        free(thrd_ctrl->del_req_set);
         free(thrd_ctrl);
         return NULL;
     }
@@ -170,9 +129,6 @@ reqmgr_thrd_t* unifyfs_rm_thrd_create(int app_id, int client_id)
                "manager thread app_id=%d client_id=%d rc=%d (%s)",
                app_id, client_id, rc, strerror(rc));
         pthread_mutex_destroy(&(thrd_ctrl->thrd_lock));
-        free(thrd_ctrl->del_req_stat->req_stat);
-        free(thrd_ctrl->del_req_stat);
-        free(thrd_ctrl->del_req_set);
         free(thrd_ctrl);
         return NULL;
     }
@@ -194,9 +150,6 @@ reqmgr_thrd_t* unifyfs_rm_thrd_create(int app_id, int client_id)
     if (rc != 0) {
         pthread_cond_destroy(&(thrd_ctrl->thrd_cond));
         pthread_mutex_destroy(&(thrd_ctrl->thrd_lock));
-        free(thrd_ctrl->del_req_stat->req_stat);
-        free(thrd_ctrl->del_req_stat);
-        free(thrd_ctrl->del_req_set);
         free(thrd_ctrl);
         return NULL;
     }
@@ -211,9 +164,6 @@ reqmgr_thrd_t* unifyfs_rm_thrd_create(int app_id, int client_id)
                app_id, client_id, rc, strerror(rc));
         pthread_cond_destroy(&(thrd_ctrl->thrd_cond));
         pthread_mutex_destroy(&(thrd_ctrl->thrd_lock));
-        free(thrd_ctrl->del_req_stat->req_stat);
-        free(thrd_ctrl->del_req_stat);
-        free(thrd_ctrl->del_req_set);
         free(thrd_ctrl);
         return NULL;
     }
@@ -227,52 +177,14 @@ reqmgr_thrd_t* rm_get_thread(int thrd_id)
     return (reqmgr_thrd_t*) arraylist_get(rm_thrd_list, thrd_id);
 }
 
-static void print_send_msgs(send_msg_t* send_metas,
-                            int msg_cnt)
-{
-    int i;
-    send_msg_t* msg;
-    for (i = 0; i < msg_cnt; i++) {
-        msg = send_metas + i;
-        LOGDBG("msg[%d] gfid:%d length:%zu file_offset:%zu "
-               "dest_offset:%zu dest_app:%d dest_clid:%d",
-               i, msg->src_fid, msg->length, msg->src_offset,
-               msg->dest_offset, msg->dest_app_id, msg->dest_client_id);
-    }
-}
-
-static void print_remote_del_reqs(int app_id, int cli_id,
-                                  del_req_stat_t* del_req_stat)
-{
-    int i;
-    for (i = 0; i < del_req_stat->del_cnt; i++) {
-        LOGDBG("remote_delegator:%d, req_cnt:%d",
-               del_req_stat->req_stat[i].del_id,
-               del_req_stat->req_stat[i].req_cnt);
-    }
-}
-
-#if 0 // NOT CURRENTLY USED
-static void print_recv_msg(int app_id, int cli_id,
-                           int thrd_id,
-                           shm_meta_t* msg)
-{
-    LOGDBG("recv_msg: app_id:%d, cli_id:%d, thrd_id:%d, "
-           "fid:%d, offset:%ld, len:%ld",
-           app_id, cli_id, thrd_id, msg->src_fid,
-           msg->offset, msg->length);
-}
-#endif
-
-
 /* order keyvals by gfid, then host delegator rank */
 static int compare_kv_gfid_rank(const void* a, const void* b)
 {
     const unifyfs_keyval_t* kv_a = a;
     const unifyfs_keyval_t* kv_b = b;
 
-    int gfid_a = kv_a->key.fid;
-    int gfid_b = kv_b->key.fid;
+    int gfid_a = kv_a->key.gfid;
+    int gfid_b = kv_b->key.gfid;
     if (gfid_a == gfid_b) {
         int rank_a = kv_a->val.delegator_rank;
         int rank_b = kv_b->val.delegator_rank;
@@ -284,23 +196,6 @@ static int compare_kv_gfid_rank(const void* a, const void* b)
             return 1;
         }
     } else if (gfid_a < gfid_b) {
-        return -1;
-    } else {
-        return 1;
-    }
-}
-
-/* order read requests by destination delegator rank */
-static int compare_msg_delegators(const void* a, const void* b)
-{
-    const send_msg_t* msg_a = a;
-    const send_msg_t* msg_b = b;
-    int rank_a = msg_a->dest_delegator_rank;
-    int rank_b = msg_b->dest_delegator_rank;
-
-    if (rank_a == rank_b) {
-        return 0;
-    } else if (rank_a < rank_b) {
         return -1;
     } else {
         return 1;
@@ -321,22 +216,6 @@ unifyfs_key_t** alloc_key_array(int elems)
     }
 
     return (unifyfs_key_t**)mem_block;
-}
-
-fattr_key_t** alloc_attr_key_array(int elems)
-{
-    int size = elems * (sizeof(fattr_key_t*) + sizeof(fattr_key_t));
-
-    void* mem_block = calloc(size, sizeof(char));
-
-    fattr_key_t** array_ptr = mem_block;
-    fattr_key_t* key_ptr = (fattr_key_t*)(array_ptr + elems);
-
-    for (int i = 0; i < elems; i++) {
-        array_ptr[i] = &key_ptr[i];
-    }
-
-    return (fattr_key_t**)mem_block;
 }
 
 unifyfs_val_t** alloc_value_array(int elems)
@@ -361,11 +240,6 @@ void free_key_array(unifyfs_key_t** array)
 }
 
 void free_value_array(unifyfs_val_t** array)
-{
-    free(array);
-}
-
-void free_attr_key_array(fattr_key_t** array)
 {
     free(array);
 }
@@ -472,120 +346,16 @@ static void signal_new_responses(reqmgr_thrd_t* thrd_ctrl)
 }
 
 /* issue remote chunk read requests for extent chunks
- * contained within keyvals
- */
-int create_request_messages(reqmgr_thrd_t* thrd_ctrl,
-                            int client_rank,
-                            int num_vals,
-                            unifyfs_keyval_t* keyvals)
-{
-    int thrd_id = thrd_ctrl->thrd_ndx;
-    int app_id = thrd_ctrl->app_id;
-    int client_id = thrd_ctrl->client_id;
-
-    /* wait for lock for shared data structures holding requests
-     * and condition variable */
-    RM_LOCK(thrd_ctrl);
-
-    // set up the thread_control delegator request set
-    // TODO: make this a function
-    int i;
-    for (i = 0; i < num_vals; i++) {
-        send_msg_t* meta = &(thrd_ctrl->del_req_set->msg_meta[i]);
-        memset(meta, 0, sizeof(send_msg_t));
-
-        debug_log_key_val(__func__, &keyvals[i].key, &keyvals[i].val);
-
-        /* physical offset of the requested file segment on the log file */
-        meta->dest_offset = keyvals[i].val.addr;
-
-        /* rank of the remote delegator */
-        meta->dest_delegator_rank = keyvals[i].val.delegator_rank;
-
-        /* dest_client_id and dest_app_id uniquely identify the remote
-         * physical log file that contains the requested segments */
-        meta->dest_app_id    = keyvals[i].val.app_id;
-        meta->dest_client_id = keyvals[i].val.rank;
-        meta->length         = (size_t)keyvals[i].val.len;
-
-        /* src_app_id and src_cli_id identifies the requested client */
-        meta->src_app_id = app_id;
-        meta->src_cli_id = client_id;
-
-        /* src_offset is the logical offset of the shared file */
-        meta->src_offset         = keyvals[i].key.offset;
-        meta->src_delegator_rank = glb_mpi_rank;
-        meta->src_fid            = keyvals[i].key.fid;
-        meta->src_dbg_rank       = client_rank;
-        meta->src_thrd           = thrd_id;
-    }
-
-    thrd_ctrl->del_req_set->num = num_vals;
-
-    if (num_vals > 1) {
-        /* sort read requests to be sent to the same delegators. */
-        qsort(thrd_ctrl->del_req_set->msg_meta,
-              thrd_ctrl->del_req_set->num,
-              sizeof(send_msg_t), compare_msg_delegators);
-    }
-
-    /* debug print */
-    print_send_msgs(thrd_ctrl->del_req_set->msg_meta,
-                    thrd_ctrl->del_req_set->num);
-
-    /* get pointer to list of delegator stat objects to record
-     * delegator rank and count of requests for each delegator */
-    per_del_stat_t* req_stat = thrd_ctrl->del_req_stat->req_stat;
-
-    /* get pointer to send message structures, one for each request */
-    send_msg_t* msg_meta = thrd_ctrl->del_req_set->msg_meta;
-
-    /* iterate over read requests and count number of requests
-     * to be sent to each delegator */
-    int del_ndx = 0;
-    req_stat[del_ndx].del_id = msg_meta[0].dest_delegator_rank;
-    req_stat[del_ndx].req_cnt = 1;
-
-    for (i = 1; i < thrd_ctrl->del_req_set->num; i++) {
-        int cur_rank = msg_meta[i].dest_delegator_rank;
-        int prev_rank = msg_meta[i-1].dest_delegator_rank;
-        if (cur_rank == prev_rank) {
-            /* another message for the current delegator */
-            req_stat[del_ndx].req_cnt++;
-        } else {
-            /* new delegator */
-            del_ndx++;
-            req_stat[del_ndx].del_id = msg_meta[i].dest_delegator_rank;
-            req_stat[del_ndx].req_cnt = 1;
-        }
-    }
-
-    /* record total number of delegators we'll send requests to */
-    thrd_ctrl->del_req_stat->del_cnt = del_ndx + 1;
-
-    /* debug print */
-    print_remote_del_reqs(app_id, thrd_id, thrd_ctrl->del_req_stat);
-
-    /* wake up the request manager thread for the requesting client */
-    signal_new_requests(thrd_ctrl);
-
-    /* done updating shared variables, release the lock */
-    RM_UNLOCK(thrd_ctrl);
-
-    return UNIFYFS_SUCCESS;
-}
-
-/* issue remote chunk read requests for extent chunks
  * listed within keyvals */
 int create_chunk_requests(reqmgr_thrd_t* thrd_ctrl,
                           server_read_req_t* rdreq,
                           int num_vals,
                           unifyfs_keyval_t* keyvals)
 {
-    int thrd_id = thrd_ctrl->thrd_ndx;
+    /* get app id for this request batch */
     int app_id = thrd_ctrl->app_id;
-    int client_id = thrd_ctrl->client_id;
 
+    /* allocate read request structures */
     chunk_read_req_t* all_chunk_reads = (chunk_read_req_t*)
         calloc((size_t)num_vals, sizeof(chunk_read_req_t));
     if (NULL == all_chunk_reads) {
@@ -593,36 +363,45 @@ int create_chunk_requests(reqmgr_thrd_t* thrd_ctrl,
         return UNIFYFS_ERROR_NOMEM;
     }
 
+    /* wait on lock before we attach new array to global variable */
     RM_LOCK(thrd_ctrl);
 
     LOGDBG("creating chunk requests for rdreq %d", rdreq->req_ndx);
 
+    /* attach read request array to global request mananger struct */
     rdreq->chunks = all_chunk_reads;
 
-    int i, curr_del;
+    /* iterate over write index values and create read requests
+     * for each one, also count up number of delegators that we'll
+     * forward read requests to */
+    int i;
     int prev_del = -1;
-    int del_ndx = 0;
-    chunk_read_req_t* chk_read;
+    int num_del = 0;
     for (i = 0; i < num_vals; i++) {
-        /* count the delegators */
-        curr_del = keyvals[i].val.delegator_rank;
-        if ((prev_del != -1) && (curr_del != prev_del)) {
-            del_ndx++;
+        /* get target delegator for this request */
+        int curr_del = keyvals[i].val.delegator_rank;
+
+        /* if target delegator is different from last target,
+         * increment our delegator count */
+        if ((prev_del == -1) || (curr_del != prev_del)) {
+            num_del++;
         }
         prev_del = curr_del;
 
-        /* create chunk-reads */
+        /* get pointer to next read request structure */
         debug_log_key_val(__func__, &keyvals[i].key, &keyvals[i].val);
-        chk_read = all_chunk_reads + i;
-        chk_read->nbytes = keyvals[i].val.len;
-        chk_read->offset = keyvals[i].key.offset;
-        chk_read->log_offset = keyvals[i].val.addr;
-        chk_read->log_app_id = keyvals[i].val.app_id;
-        chk_read->log_client_id = keyvals[i].val.rank;
+        chunk_read_req_t* chk = all_chunk_reads + i;
+
+        /* fill in chunk read request */
+        chk->nbytes        = keyvals[i].val.len;
+        chk->offset        = keyvals[i].key.offset;
+        chk->log_offset    = keyvals[i].val.addr;
+        chk->log_app_id    = keyvals[i].val.app_id;
+        chk->log_client_id = keyvals[i].val.rank;
     }
 
     /* allocate per-delgator chunk-reads */
-    int num_dels = del_ndx + 1;
+    int num_dels = num_del;
     rdreq->num_remote_reads = num_dels;
     rdreq->remote_reads = (remote_chunk_reads_t*)
         calloc((size_t)num_dels, sizeof(remote_chunk_reads_t));
@@ -632,44 +411,124 @@ int create_chunk_requests(reqmgr_thrd_t* thrd_ctrl,
         return UNIFYFS_ERROR_NOMEM;
     }
 
-    /* populate per-delegator chunk-reads info */
-    size_t del_data_sz = 0;
-    remote_chunk_reads_t* del_reads;
+    /* get pointer to start of chunk read request array */
+    remote_chunk_reads_t* reads = rdreq->remote_reads;
+
+    /* iterate over write index values again and now create
+     * per-delegator chunk-reads info, for each delegator
+     * that we'll request data from, this totals up the number
+     * of read requests and total read data size from that
+     * delegator  */
     prev_del = -1;
-    del_ndx = 0;
+    size_t del_data_sz = 0;
     for (i = 0; i < num_vals; i++) {
-        curr_del = keyvals[i].val.delegator_rank;
+        /* get target delegator for this request */
+        int curr_del = keyvals[i].val.delegator_rank;
+
+        /* if target delegator is different from last target,
+         * close out the total number of bytes for the last
+         * delegator, note this assumes our write index values are
+         * sorted by delegator rank */
         if ((prev_del != -1) && (curr_del != prev_del)) {
             /* record total data for previous delegator */
-            del_reads = rdreq->remote_reads + del_ndx;
-            del_reads->total_sz = del_data_sz;
-            /* advance to next delegator */
-            del_ndx++;
+            reads->total_sz = del_data_sz;
+
+            /* advance to read request for next delegator */
+            reads += 1;
+
+            /* reset our running tally of bytes to 0 */
             del_data_sz = 0;
         }
         prev_del = curr_del;
 
-        /* update total data size for current delegator */
+        /* update total read data size for current delegator */
         del_data_sz += keyvals[i].val.len;
 
-        del_reads = rdreq->remote_reads + del_ndx;
-        if (0 == del_reads->num_chunks) {
-            /* initialize structure */
-            del_reads->rank = curr_del;
-            del_reads->rdreq_id = rdreq->req_ndx;
-            del_reads->reqs = all_chunk_reads + i;
-            del_reads->resp = NULL;
+        /* if this is the first read request for this delegator,
+         * initialize fields on the per-delegator read request
+         * structure */
+        if (0 == reads->num_chunks) {
+            /* TODO: let's describe what these fields are for */
+            reads->rank     = curr_del;
+            reads->rdreq_id = rdreq->req_ndx;
+            reads->reqs     = all_chunk_reads + i;
+            reads->resp     = NULL;
         }
-        del_reads->num_chunks++;
+
+        /* increment number of read requests we're sending
+         * to this delegator */
+        reads->num_chunks++;
     }
-    del_reads = rdreq->remote_reads + del_ndx;
-    del_reads->total_sz = del_data_sz;
+
+    /* record total data size for final delegator (if any),
+     * would have missed doing this in the above loop */
+    if (num_vals > 0) {
+        reads->total_sz = del_data_sz;
+    }
+
+    /* mark request as ready to be started */
+    rdreq->status = READREQ_READY;
 
     /* wake up the request manager thread for the requesting client */
     signal_new_requests(thrd_ctrl);
+
     RM_UNLOCK(thrd_ctrl);
 
     return UNIFYFS_SUCCESS;
+}
+
+/* signal the client process for it to start processing read
+ * data in shared memory */
+static int client_signal(shm_header_t* hdr,
+                         shm_region_state_e flag)
+{
+    if (flag == SHMEM_REGION_DATA_READY) {
+        LOGDBG("setting data-ready");
+    } else if (flag == SHMEM_REGION_DATA_COMPLETE) {
+        LOGDBG("setting data-complete");
+    }
+
+    /* we signal the client by setting a flag value within
+     * a shared memory segment that the client is monitoring */
+    hdr->state = flag;
+
+    /* TODO: MEM_FLUSH */
+
+    return UNIFYFS_SUCCESS;
+}
+
+/* wait until client has processed all read data in shared memory */
+static int client_wait(shm_header_t* hdr)
+{
+    int rc = (int)UNIFYFS_SUCCESS;
+
+    /* specify time to sleep between checking flag in shared
+     * memory indicating client has processed data */
+    struct timespec shm_wait_tm;
+    shm_wait_tm.tv_sec  = 0;
+    shm_wait_tm.tv_nsec = SHM_WAIT_INTERVAL;
+
+    /* wait for client to set flag to 0 */
+    int max_sleep = 10000000; // 10s
+    volatile int* vip = (volatile int*)&(hdr->state);
+    while (*vip != SHMEM_REGION_EMPTY) {
+        /* not there yet, sleep for a while */
+        nanosleep(&shm_wait_tm, NULL);
+
+        /* TODO: MEM_FETCH */
+
+        max_sleep--;
+        if (0 == max_sleep) {
+            LOGERR("timed out waiting for empty");
+            rc = (int)UNIFYFS_ERROR_SHMEM;
+            break;
+        }
+    }
+
+    /* reset header to reflect empty state */
+    hdr->meta_cnt = 0;
+    hdr->bytes = 0;
+    return rc;
 }
 
 /************************
@@ -686,14 +545,16 @@ int rm_cmd_filesize(
     int gfid,      /* global file id of read request */
     size_t* outsize) /* output file size */
 {
+    /* initialize output file size to something deterministic,
+     * in case we drop out with an error */
+    *outsize = 0;
+
     /* set offset and length to request *all* key/value pairs
      * for this file */
     size_t offset = 0;
 
     /* want to pick the highest integer offset value a file
      * could have here */
-    // TODO: would like to unsed max for unsigned long, but
-    // that fails to return any keys for some reason
     size_t length = (SIZE_MAX >> 1) - 1;
 
     /* get the locations of all the read requests from the
@@ -701,29 +562,24 @@ int rm_cmd_filesize(
     unifyfs_key_t key1, key2;
 
     /* create key to describe first byte we'll read */
-    key1.fid    = gfid;
+    key1.gfid   = gfid;
     key1.offset = offset;
 
     /* create key to describe last byte we'll read */
-    key2.fid    = gfid;
+    key2.gfid   = gfid;
     key2.offset = offset + length - 1;
 
-    unifyfs_keyval_t* keyvals;
+    /* set up input params to specify range lookup */
     unifyfs_key_t* unifyfs_keys[2] = {&key1, &key2};
     int key_lens[2] = {sizeof(unifyfs_key_t), sizeof(unifyfs_key_t)};
 
     /* look up all entries in this range */
     int num_vals = 0;
-    keyvals = (unifyfs_keyval_t*) calloc(UNIFYFS_MAX_SPLIT_CNT,
-                                         sizeof(unifyfs_keyval_t));
+    unifyfs_keyval_t* keyvals = NULL;
     int rc = unifyfs_get_file_extents(2, unifyfs_keys, key_lens,
                                       &num_vals, &keyvals);
-    /* TODO: if there are file extents not accounted for we should
-     * either return 0 for that date (holes) or EOF if reading past
-     * the end of the file */
     if (UNIFYFS_SUCCESS != rc) {
-        // we need to let the client know that there was an error
-        free(keyvals);
+        /* failed to look up extents, bail with error */
         return UNIFYFS_FAILURE;
     }
 
@@ -744,11 +600,652 @@ int rm_cmd_filesize(
         }
     }
 
-    // cleanup
-    free(keyvals);
+    /* free off key/value buffer returned from get_file_extents */
+    if (NULL != keyvals) {
+        free(keyvals);
+        keyvals = NULL;
+    }
+
+    /* get filesize as recorded in metadata, which may be bigger if
+     * user issued an ftruncate on the file to extend it past the
+     * last write */
+    size_t filesize_meta = filesize;
+
+    /* given the global file id, look up file attributes
+     * from key/value store */
+    unifyfs_file_attr_t fattr;
+    int ret = unifyfs_get_file_attribute(gfid, &fattr);
+    if (ret == UNIFYFS_SUCCESS) {
+        /* found file attribute for this file, now get its size */
+        filesize_meta = fattr.size;
+    } else {
+        /* failed to find file attributes for this file */
+        return UNIFYFS_FAILURE;
+    }
+
+    /* take maximum of last write and file size from metadata */
+    if (filesize_meta > filesize) {
+        filesize = filesize_meta;
+    }
 
     *outsize = filesize;
     return rc;
+}
+
+/* delete any key whose last byte is beyond the specified
+ * file size */
+static int truncate_delete_keys(
+    size_t filesize,           /* new file size */
+    int num,                   /* number of entries in keyvals */
+    unifyfs_keyval_t* keyvals) /* list of existing key/values */
+{
+    /* assume we'll succeed */
+    int ret = (int) UNIFYFS_SUCCESS;
+
+    /* pointers to memory we'll dynamically allocate for file extents */
+    unifyfs_key_t** unifyfs_keys = NULL;
+    unifyfs_val_t** unifyfs_vals = NULL;
+    int* unifyfs_key_lens        = NULL;
+    int* unifyfs_val_lens        = NULL;
+
+    /* in the worst case, we'll have to delete all existing keys */
+    /* allocate storage for file extent key/values */
+    /* TODO: possibly get this from memory pool */
+    unifyfs_keys     = alloc_key_array(num);
+    unifyfs_vals     = alloc_value_array(num);
+    unifyfs_key_lens = calloc(num, sizeof(int));
+    unifyfs_val_lens = calloc(num, sizeof(int));
+    if ((NULL == unifyfs_keys) ||
+        (NULL == unifyfs_vals) ||
+        (NULL == unifyfs_key_lens) ||
+        (NULL == unifyfs_val_lens)) {
+        LOGERR("failed to allocate memory for file extents");
+        ret = (int)UNIFYFS_ERROR_NOMEM;
+        goto truncate_delete_exit;
+    }
+
+    /* counter for number of key/values we need to delete */
+    int delete_count = 0;
+
+    /* iterate over each key, and if this index extends beyond desired
+     * file size, create an entry to delete that key */
+    int i;
+    for (i = 0; i < num; i++) {
+        /* get pointer to next key value pair */
+        unifyfs_keyval_t* kv = &keyvals[i];
+
+        /* get last byte offset for this segment of the file */
+        size_t last_offset = kv->key.offset + kv->val.len;
+
+        /* if this segment extends beyond the new file size,
+         * we need to delete this index entry */
+        if (last_offset > filesize) {
+            /* found an index that extends past end of desired
+             * file size, get next empty key entry from the pool */
+            unifyfs_key_t* key = unifyfs_keys[delete_count];
+
+            /* define the key to be deleted */
+            key->gfid   = kv->key.gfid;
+            key->offset = kv->key.offset;
+
+            /* MDHIM needs to know the byte size of each key and value */
+            unifyfs_key_lens[delete_count] = sizeof(unifyfs_key_t);
+            //unifyfs_val_lens[delete_count] = sizeof(unifyfs_val_t);
+
+            /* increment the number of keys we're deleting */
+            delete_count++;
+        }
+    }
+
+    /* batch delete file extent key/values from MDHIM */
+    if (delete_count > 0) {
+        ret = unifyfs_delete_file_extents(delete_count,
+            unifyfs_keys, unifyfs_key_lens);
+        if (ret != UNIFYFS_SUCCESS) {
+            /* TODO: need proper error handling */
+            LOGERR("unifyfs_delete_file_extents() failed");
+            goto truncate_delete_exit;
+        }
+    }
+
+truncate_delete_exit:
+    /* clean up memory */
+
+    if (NULL != unifyfs_keys) {
+        free_key_array(unifyfs_keys);
+    }
+
+    if (NULL != unifyfs_vals) {
+        free_value_array(unifyfs_vals);
+    }
+
+    if (NULL != unifyfs_key_lens) {
+        free(unifyfs_key_lens);
+    }
+
+    if (NULL != unifyfs_val_lens) {
+        free(unifyfs_val_lens);
+    }
+
+    return ret;
+}
+
+/* rewrite any key that overlaps with new file size,
+ * we assume the existing key has already been deleted */
+static int truncate_rewrite_keys(
+    size_t filesize,           /* new file size */
+    int num,                   /* number of entries in keyvals */
+    unifyfs_keyval_t* keyvals) /* list of existing key/values */
+{
+    /* assume we'll succeed */
+    int ret = (int) UNIFYFS_SUCCESS;
+
+    /* pointers to memory we'll dynamically allocate for file extents */
+    unifyfs_key_t** unifyfs_keys = NULL;
+    unifyfs_val_t** unifyfs_vals = NULL;
+    int* unifyfs_key_lens        = NULL;
+    int* unifyfs_val_lens        = NULL;
+
+    /* in the worst case, we'll have to rewrite all existing keys */
+    /* allocate storage for file extent key/values */
+    /* TODO: possibly get this from memory pool */
+    unifyfs_keys     = alloc_key_array(num);
+    unifyfs_vals     = alloc_value_array(num);
+    unifyfs_key_lens = calloc(num, sizeof(int));
+    unifyfs_val_lens = calloc(num, sizeof(int));
+    if ((NULL == unifyfs_keys) ||
+        (NULL == unifyfs_vals) ||
+        (NULL == unifyfs_key_lens) ||
+        (NULL == unifyfs_val_lens)) {
+        LOGERR("failed to allocate memory for file extents");
+        ret = (int)UNIFYFS_ERROR_NOMEM;
+        goto truncate_rewrite_exit;
+    }
+
+    /* counter for number of key/values we need to rewrite */
+    int count = 0;
+
+    /* iterate over each key, and if this index starts before
+     * and ends after the desired file size, create an entry
+     * that ends at new file size */
+    int i;
+    for (i = 0; i < num; i++) {
+        /* get pointer to next key value pair */
+        unifyfs_keyval_t* kv = &keyvals[i];
+
+        /* get first byte offset for this segment of the file */
+        size_t first_offset = kv->key.offset;
+
+        /* get last byte offset for this segment of the file */
+        size_t last_offset = kv->key.offset + kv->val.len;
+
+        /* if this segment extends beyond the new file size,
+         * we need to rewrite this index entry */
+        if (first_offset < filesize &&
+            last_offset  > filesize) {
+            /* found an index that overlaps end of desired
+             * file size, get next empty key entry from the pool */
+            unifyfs_key_t* key = unifyfs_keys[count];
+
+            /* define the key to be rewritten */
+            key->gfid   = kv->key.gfid;
+            key->offset = kv->key.offset;
+
+            /* compute new length of this entry */
+            size_t newlen = (size_t)(filesize - first_offset);
+
+            /* for the value, we store the log position, the length,
+             * the host server (delegator rank), the mount point id
+             * (app id), and the client id (rank) */
+            unifyfs_val_t* val = unifyfs_vals[count];
+            val->addr           = kv->val.addr;
+            val->len            = newlen;
+            val->delegator_rank = kv->val.delegator_rank;
+            val->app_id         = kv->val.app_id;
+            val->rank           = kv->val.rank;
+
+            /* MDHIM needs to know the byte size of each key and value */
+            unifyfs_key_lens[count] = sizeof(unifyfs_key_t);
+            unifyfs_val_lens[count] = sizeof(unifyfs_val_t);
+
+            /* increment the number of keys we're deleting */
+            count++;
+        }
+    }
+
+    /* batch set file extent key/values from MDHIM */
+    if (count > 0) {
+        ret = unifyfs_set_file_extents(count,
+            unifyfs_keys, unifyfs_key_lens,
+            unifyfs_vals, unifyfs_val_lens);
+        if (ret != UNIFYFS_SUCCESS) {
+            /* TODO: need proper error handling */
+            LOGERR("unifyfs_set_file_extents() failed");
+            goto truncate_rewrite_exit;
+        }
+    }
+
+truncate_rewrite_exit:
+    /* clean up memory */
+
+    if (NULL != unifyfs_keys) {
+        free_key_array(unifyfs_keys);
+    }
+
+    if (NULL != unifyfs_vals) {
+        free_value_array(unifyfs_vals);
+    }
+
+    if (NULL != unifyfs_key_lens) {
+        free(unifyfs_key_lens);
+    }
+
+    if (NULL != unifyfs_val_lens) {
+        free(unifyfs_val_lens);
+    }
+
+    return ret;
+}
+
+/* given an app_id, client_id, global file id,
+ * and file size, truncate file to specified size
+ */
+int rm_cmd_truncate(
+    int app_id,     /* app_id for requesting client */
+    int client_id,  /* client_id for requesting client */
+    int gfid,       /* global file id */
+    size_t newsize) /* desired file size */
+{
+    /* set offset and length to request *all* key/value pairs
+     * for this file */
+    size_t offset = 0;
+
+    /* want to pick the highest integer offset value a file
+     * could have here */
+    size_t length = (SIZE_MAX >> 1) - 1;
+
+    /* get the locations of all the read requests from the
+     * key-value store*/
+    unifyfs_key_t key1, key2;
+
+    /* create key to describe first byte we'll read */
+    key1.gfid   = gfid;
+    key1.offset = offset;
+
+    /* create key to describe last byte we'll read */
+    key2.gfid   = gfid;
+    key2.offset = offset + length - 1;
+
+    /* set up input params to specify range lookup */
+    unifyfs_key_t* unifyfs_keys[2] = {&key1, &key2};
+    int key_lens[2] = {sizeof(unifyfs_key_t), sizeof(unifyfs_key_t)};
+
+    /* look up all entries in this range */
+    int num_vals = 0;
+    unifyfs_keyval_t* keyvals = NULL;
+    int rc = unifyfs_get_file_extents(2, unifyfs_keys, key_lens,
+                                      &num_vals, &keyvals);
+    if (UNIFYFS_SUCCESS != rc) {
+        /* failed to look up extents, bail with error */
+        return UNIFYFS_FAILURE;
+    }
+
+    /* compute our file size by iterating over each file
+     * segment and taking the max logical offset */
+    int i;
+    size_t filesize = 0;
+    for (i = 0; i < num_vals; i++) {
+        /* get pointer to next key value pair */
+        unifyfs_keyval_t* kv = &keyvals[i];
+
+        /* get last byte offset for this segment of the file */
+        size_t last_offset = kv->key.offset + kv->val.len;
+
+        /* update our filesize if this offset is bigger than the current max */
+        if (last_offset > filesize) {
+            filesize = last_offset;
+        }
+    }
+
+    /* get filesize as recorded in metadata, which may be bigger if
+     * user issued an ftruncate on the file to extend it past the
+     * last write */
+    size_t filesize_meta = filesize;
+
+    /* given the global file id, look up file attributes
+     * from key/value store */
+    unifyfs_file_attr_t fattr;
+    rc = unifyfs_get_file_attribute(gfid, &fattr);
+    if (rc == UNIFYFS_SUCCESS) {
+        /* found file attribute for this file, now get its size */
+        filesize_meta = fattr.size;
+    } else {
+        /* failed to find file attributes for this file */
+        goto truncate_exit;
+    }
+
+    /* take maximum of last write and file size from metadata */
+    if (filesize_meta > filesize) {
+        filesize = filesize_meta;
+    }
+
+    /* may need to throw away and rewrite keys if shrinking file */
+    if (newsize < filesize) {
+        /* delete any key that extends beyond new file size */
+        rc = truncate_delete_keys(newsize, num_vals, keyvals);
+        if (rc != UNIFYFS_SUCCESS) {
+            goto truncate_exit;
+        }
+
+        /* rewrite any key that overlaps new file size */
+        rc = truncate_rewrite_keys(newsize, num_vals, keyvals);
+        if (rc != UNIFYFS_SUCCESS) {
+            goto truncate_exit;
+        }
+    }
+
+    /* update file size field with latest size */
+    fattr.size = newsize;
+    rc = unifyfs_set_file_attribute(1, 0, &fattr);
+    if (rc != UNIFYFS_SUCCESS) {
+        /* failed to update file attributes with new file size */
+        goto truncate_exit;
+    }
+
+truncate_exit:
+
+    /* free off key/value buffer returned from get_file_extents */
+    if (NULL != keyvals) {
+        free(keyvals);
+        keyvals = NULL;
+    }
+
+    return rc;
+}
+
+/* given an app_id, client_id, and global file id,
+ * remove file */
+int rm_cmd_unlink(
+    int app_id,     /* app_id for requesting client */
+    int client_id,  /* client_id for requesting client */
+    int gfid)       /* global file id */
+{
+    int rc = UNIFYFS_SUCCESS;
+
+    /* given the global file id, look up file attributes
+     * from key/value store */
+    unifyfs_file_attr_t attr;
+    int ret = unifyfs_get_file_attribute(gfid, &attr);
+    if (ret != UNIFYFS_SUCCESS) {
+        /* failed to find attributes for the file */
+        return ret;
+    }
+
+    /* if item is a file, call truncate to free space */
+    mode_t mode = (mode_t) attr.mode;
+    if ((mode & S_IFMT) == S_IFREG) {
+        /* item is regular file, truncate to 0 */
+        ret = rm_cmd_truncate(app_id, client_id, gfid, 0);
+        if (ret != UNIFYFS_SUCCESS) {
+            /* failed to delete write extents for file,
+             * let's leave the file attributes in place */
+            return ret;
+        }
+    }
+
+    /* delete metadata */
+    ret = unifyfs_delete_file_attribute(gfid);
+    if (ret != UNIFYFS_SUCCESS) {
+        rc = ret;
+    }
+
+    return rc;
+}
+
+/* given an app_id, client_id, and global file id,
+ * laminate file */
+int rm_cmd_laminate(
+    int app_id,     /* app_id for requesting client */
+    int client_id,  /* client_id for requesting client */
+    int gfid)       /* global file id */
+{
+    int rc = UNIFYFS_SUCCESS;
+
+    /* given the global file id, look up file attributes
+     * from key/value store */
+    unifyfs_file_attr_t attr;
+    int ret = unifyfs_get_file_attribute(gfid, &attr);
+    if (ret != UNIFYFS_SUCCESS) {
+        /* failed to find attributes for the file */
+        return ret;
+    }
+
+    /* if item is not a file, bail with error */
+    mode_t mode = (mode_t) attr.mode;
+    if ((mode & S_IFMT) != S_IFREG) {
+        /* item is not a regular file */
+        return UNIFYFS_ERROR_INVAL;
+    }
+
+    /* lookup current file size */
+    size_t filesize;
+    ret = rm_cmd_filesize(app_id, client_id, gfid, &filesize);
+    if (ret != UNIFYFS_SUCCESS) {
+        /* failed to get file size for file */
+        return ret;
+    }
+
+    /* update fields in metadata */
+    attr.size         = filesize;
+    attr.is_laminated = 1;
+
+    /* update metadata, set size and laminate */
+    rc = unifyfs_set_file_attribute(1, 1, &attr);
+
+    return rc;
+}
+
+int create_gfid_chunk_reads(reqmgr_thrd_t* thrd_ctrl,
+                            int gfid, int app_id, int client_id,
+                            int num_keys, unifyfs_key_t** keys, int* keylens)
+{
+    /* lookup all key/value pairs for given range */
+    int num_vals = 0;
+    unifyfs_keyval_t* keyvals = NULL;
+    int rc = unifyfs_get_file_extents(num_keys, keys, keylens,
+                                      &num_vals, &keyvals);
+
+    /* this is to maintain limits imposed in previous code
+     * that would throw fatal errors */
+    if (num_vals >= UNIFYFS_MAX_SPLIT_CNT ||
+        num_vals >= MAX_META_PER_SEND) {
+        LOGERR("too many key/values returned in range lookup");
+        if (NULL != keyvals) {
+            free(keyvals);
+            keyvals = NULL;
+        }
+        return UNIFYFS_ERROR_NOMEM;
+    }
+
+    if (UNIFYFS_SUCCESS != rc) {
+        /* failed to find any key / value pairs */
+        rc = UNIFYFS_FAILURE;
+    } else {
+        /* if we get more than one write index entry
+         * sort them by file id and then by delegator rank */
+        if (num_vals > 1) {
+            qsort(keyvals, (size_t)num_vals, sizeof(unifyfs_keyval_t),
+                  compare_kv_gfid_rank);
+        }
+
+        server_read_req_t* rdreq = reserve_read_req(thrd_ctrl);
+        if (NULL == rdreq) {
+            rc = UNIFYFS_FAILURE;
+        } else {
+            rdreq->app_id         = app_id;
+            rdreq->client_id      = client_id;
+            rdreq->extent.gfid    = gfid;
+            rdreq->extent.errcode = EINPROGRESS;
+
+            rc = create_chunk_requests(thrd_ctrl, rdreq,
+                                       num_vals, keyvals);
+            if (rc != (int)UNIFYFS_SUCCESS) {
+                release_read_req(thrd_ctrl, rdreq);
+            }
+        }
+    }
+
+    /* free off key/value buffer returned from get_file_extents */
+    if (NULL != keyvals) {
+        free(keyvals);
+        keyvals = NULL;
+    }
+
+    return rc;
+}
+
+/* return number of slice ranges needed to cover range */
+static size_t num_slices(size_t offset, size_t length)
+{
+    size_t start = offset / max_recs_per_slice;
+    size_t end   = (offset + length - 1) / max_recs_per_slice;
+    size_t count = end - start + 1;
+    return count;
+}
+
+/* given a global file id, an offset, and a length to read from that
+ * file, create keys needed to query MDHIM for location of data
+ * corresponding to that extent, returns the number of keys inserted
+ * into key array provided by caller */
+static int split_request(
+    unifyfs_key_t** keys, /* list to add newly created keys into */
+    int* keylens,         /* list to add byte size of each key */
+    int gfid,             /* target global file id to read from */
+    size_t offset,        /* starting offset of read */
+    size_t length)        /* number of bytes to read */
+{
+    /* offset of first byte in request */
+    size_t pos = offset;
+
+    /* offset of last byte in request */
+    size_t last_offset = offset + length - 1;
+
+    /* iterate over slice ranges and generate a start/end
+     * pair of keys for each */
+    int count = 0;
+    while (pos <= last_offset) {
+        /* compute offset for first byte in this segment */
+        size_t start = pos;
+
+        /* offset for last byte in this segment,
+         * assume that's the last byte of the same segment
+         * containing start, unless that happens to be
+         * beyond the last byte of the actual request */
+        size_t start_slice = start / max_recs_per_slice;
+        size_t end = (start_slice + 1) * max_recs_per_slice - 1;
+        if (end > last_offset) {
+            end = last_offset;
+        }
+
+        /* create key to describe first byte we'll read
+         * in this slice */
+        keys[count]->gfid   = gfid;
+        keys[count]->offset = start;
+        keylens[count] = sizeof(unifyfs_key_t);
+        count++;
+
+        /* create key to describe last byte we'll read
+         * in this slice */
+        keys[count]->gfid   = gfid;
+        keys[count]->offset = end;
+        keylens[count] = sizeof(unifyfs_key_t);
+        count++;
+
+        /* advance to first byte offset of next slice */
+        pos = end + 1;
+    }
+
+    /* return number of keys we generated */
+    return count;
+}
+
+/* given an extent corresponding to a write index, create new key/value
+ * pairs for that extent, splitting into multiple keys at the slice
+ * range boundaries (max_recs_per_slice), it returns the number of
+ * newly created key/values inserted into the given key and value
+ * arrays */
+static int split_index(
+    unifyfs_key_t** keys, /* list to add newly created keys into */
+    unifyfs_val_t** vals, /* list to add newly created values into */
+    int* keylens,         /* list for size of each key */
+    int* vallens,         /* list for size of each value */
+    int gfid,             /* global file id of write */
+    size_t offset,        /* starting byte offset of extent */
+    size_t length,        /* number of bytes in extent */
+    size_t log_offset,    /* offset within data log */
+    int server_rank,      /* rank of server hosting data */
+    int app_id,           /* app_id holding data */
+    int client_rank)      /* client rank holding data */
+{
+    /* offset of first byte in request */
+    size_t pos = offset;
+
+    /* offset of last byte in request */
+    size_t last_offset = offset + length - 1;
+
+    /* this will track the current offset within the log
+     * where the data starts, we advance it with each key
+     * we generate depending on the data associated with
+     * each key */
+    size_t logpos = log_offset;
+
+    /* iterate over slice ranges and generate a start/end
+     * pair of keys for each */
+    int count = 0;
+    while (pos <= last_offset) {
+        /* compute offset for first byte in this slice */
+        size_t start = pos;
+
+        /* offset for last byte in this slice,
+         * assume that's the last byte of the same slice
+         * containing start, unless that happens to be
+         * beyond the last byte of the actual request */
+        size_t start_slice = start / max_recs_per_slice;
+        size_t end = (start_slice + 1) * max_recs_per_slice - 1;
+        if (end > last_offset) {
+            end = last_offset;
+        }
+
+        /* length of extent in this slice */
+        size_t len = end - start + 1;
+
+        /* create key to describe this log entry */
+        unifyfs_key_t* k = keys[count];
+        k->gfid   = gfid;
+        k->offset = start;
+        keylens[count] = sizeof(unifyfs_key_t);
+
+        /* create value to store address of data */
+        unifyfs_val_t* v = vals[count];
+        v->addr           = logpos;
+        v->len            = len;
+        v->app_id         = app_id;
+        v->rank           = client_rank;
+        v->delegator_rank = server_rank;
+        vallens[count] = sizeof(unifyfs_val_t);
+
+        /* advance to next slot in key/value arrays */
+        count++;
+
+        /* advance offset into log */
+        logpos += len;
+
+        /* advance to first byte offset of next slice */
+        pos = end + 1;
+    }
+
+    /* return number of keys we generated */
+    return count;
 }
 
 /* read function for one requested extent,
@@ -773,9 +1270,6 @@ int rm_cmd_read(
     /* look up thread control structure */
     reqmgr_thrd_t* thrd_ctrl = rm_get_thread(thrd_id);
 
-    /* get debug rank for this client */
-    //int cli_rank = app_config->dbg_ranks[client_id];
-
     /* get chunks corresponding to requested client read extent
      *
      * Generate a pair of keys for the read request, representing the start
@@ -787,54 +1281,37 @@ int rm_cmd_read(
      *       other mechanism to retrieve all relevant key-value pairs from the
      *       KV-store.
      */
-    unifyfs_key_t key1, key2;
 
-    /* create key to describe first byte we'll read */
-    key1.fid    = gfid;
-    key1.offset = offset;
-
-    /* create key to describe last byte we'll read */
-    key2.fid    = gfid;
-    key2.offset = offset + length - 1;
-
-    unifyfs_key_t* unifyfs_keys[2] = {&key1, &key2};
-    int key_lens[2] = {sizeof(unifyfs_key_t), sizeof(unifyfs_key_t)};
-
-    int num_vals;
-    unifyfs_keyval_t* keyvals = calloc(UNIFYFS_MAX_SPLIT_CNT,
-                                       sizeof(unifyfs_keyval_t));
-    int rc = unifyfs_get_file_extents(2, unifyfs_keys, key_lens,
-                                      &num_vals, &keyvals);
-    /* TODO: if there are file extents not accounted for we should
-     * either return 0 for that data (holes) or EOF if reading past
-     * the end of the file */
-    if (UNIFYFS_SUCCESS != rc || num_vals == 0) {
-        /* failed to find any key / value pairs */
-        rc = UNIFYFS_FAILURE;
-    } else {
-        if (num_vals > 1) {
-            /* sort keyvals by delegator */
-            qsort(keyvals, (size_t)num_vals, sizeof(unifyfs_keyval_t),
-                  compare_kv_gfid_rank);
-        }
-        server_read_req_t* rdreq = reserve_read_req(thrd_ctrl);
-        if (NULL == rdreq) {
-            rc = UNIFYFS_FAILURE;
-        } else {
-            rdreq->app_id = app_id;
-            rdreq->client_id = client_id;
-            rdreq->extent.gfid = gfid;
-            rdreq->extent.errcode = EINPROGRESS;
-            rc = create_chunk_requests(thrd_ctrl, rdreq,
-                                       num_vals, keyvals);
-            if (rc != (int)UNIFYFS_SUCCESS) {
-                release_read_req(thrd_ctrl, rdreq);
-            }
-        }
+    /* count number of slices this range covers */
+    size_t slices = num_slices(offset, length);
+    if (slices >= UNIFYFS_MAX_SPLIT_CNT) {
+        LOGERR("Error allocating buffers");
+        return (int)UNIFYFS_ERROR_NOMEM;
     }
 
-    // cleanup
-    free(keyvals);
+    /* allocate key storage */
+    size_t key_cnt = slices * 2;
+    unifyfs_key_t** keys = alloc_key_array(key_cnt);
+    int* key_lens = (int*) calloc(key_cnt, sizeof(int));
+    if ((NULL == keys) ||
+        (NULL == key_lens)) {
+        // this is a fatal error
+        // TODO: we need better error handling
+        LOGERR("Error allocating buffers");
+        return (int)UNIFYFS_ERROR_NOMEM;
+    }
+
+    /* split range of read request at boundaries used for
+     * MDHIM range query */
+    split_request(keys, key_lens, gfid, offset, length);
+
+    /* queue up the read operations */
+    int rc = create_gfid_chunk_reads(thrd_ctrl, gfid,
+        app_id, client_id, key_cnt, keys, key_lens);
+
+    /* free memory allocated for key storage */
+    free_key_array(keys);
+    free(key_lens);
 
     return rc;
 }
@@ -843,13 +1320,17 @@ int rm_cmd_read(
  *
  * @param app_id: application id
  * @param client_id: client id for requesting process
- * @param gfid: global file id
  * @param req_num: number of read requests
  * @param reqbuf: read requests buffer
  * @return success/error code */
-int rm_cmd_mread(int app_id, int client_id,
-                 size_t req_num, void* reqbuf)
+int rm_cmd_mread(
+    int app_id,
+    int client_id,
+    size_t req_num,
+    void* reqbuf)
 {
+    int rc = UNIFYFS_SUCCESS;
+
     /* get pointer to app structure for this app id */
     app_config_t* app_config =
         (app_config_t*)arraylist_get(app_config_list, app_id);
@@ -870,75 +1351,93 @@ int rm_cmd_mread(int app_id, int client_id,
     size_t extents_len = unifyfs_Extent_vec_len(extents);
     assert(extents_len == req_num);
 
-    // allocate key storage
-    // TODO: might want to get this from a memory pool
-    unifyfs_key_t** unifyfs_keys;
-    unifyfs_keyval_t* keyvals;
-    int* key_lens;
-    size_t key_cnt = req_num * 2;
-    unifyfs_keys = alloc_key_array(key_cnt);
-    key_lens = (int*) calloc(key_cnt, sizeof(int));
-    keyvals = (unifyfs_keyval_t*) calloc(UNIFYFS_MAX_SPLIT_CNT,
-                                         sizeof(unifyfs_keyval_t));
-    if ((NULL == unifyfs_keys) ||
-        (NULL == key_lens) ||
-        (NULL == keyvals)) {
+    /* count up number of slices these request cover */
+    int j;
+    size_t slices = 0;
+    for (j = 0; j < req_num; j++) {
+        /* get offset and length of next request */
+        size_t off = unifyfs_Extent_offset(unifyfs_Extent_vec_at(extents, j));
+        size_t len = unifyfs_Extent_length(unifyfs_Extent_vec_at(extents, j));
+
+        /* add in number of slices this request needs */
+        slices += num_slices(off, len);
+    }
+    if (slices >= UNIFYFS_MAX_SPLIT_CNT) {
+        LOGERR("Error allocating buffers");
+        return (int)UNIFYFS_ERROR_NOMEM;
+    }
+
+    /* allocate key storage */
+    size_t key_cnt = slices * 2;
+    unifyfs_key_t** keys = alloc_key_array(key_cnt);
+    int* key_lens = (int*) calloc(key_cnt, sizeof(int));
+    if ((NULL == keys) ||
+        (NULL == key_lens)) {
         // this is a fatal error
         // TODO: we need better error handling
         LOGERR("Error allocating buffers");
         return (int)UNIFYFS_ERROR_NOMEM;
     }
 
-    /* get chunks corresponding to requested client read extents
-     *
-     * The loop generates a pair of keys for each read request, representing
-     * the start and end offsets. MDHIM returns all key-value pairs that fall
-     * within the offset range.
-     *
-     * TODO: this is specific to the MDHIM in the source tree and not portable
-     *       to other KV-stores. This needs to be revisited to utilize some
-     *       other mechanism to retrieve all relevant key-value pairs from the
-     *       KV-store.
-     */
-    int fid;
-    size_t j, ndx, eoff, elen;
+    /* get chunks corresponding to requested client read extents */
+    int ret;
+    int num_keys = 0;
+    int last_gfid = -1;
     for (j = 0; j < req_num; j++) {
-        ndx = 2 * j;
-        fid = unifyfs_Extent_fid(unifyfs_Extent_vec_at(extents, j));
-        eoff = unifyfs_Extent_offset(unifyfs_Extent_vec_at(extents, j));
-        elen = unifyfs_Extent_length(unifyfs_Extent_vec_at(extents, j));
-        LOGDBG("gfid:%d, offset:%zu, length:%zu", fid, eoff, elen);
+        /* get the file id for this request */
+        int gfid = unifyfs_Extent_fid(unifyfs_Extent_vec_at(extents, j));
 
-        key_lens[ndx] = sizeof(unifyfs_key_t);
-        key_lens[ndx + 1] = sizeof(unifyfs_key_t);
+        /* if we have switched to a different file, create chunk reads
+         * for the previous file */
+        if (j && (gfid != last_gfid)) {
+            /* create requests for all extents of last_gfid */
+            ret = create_gfid_chunk_reads(thrd_ctrl, last_gfid,
+                app_id, client_id, num_keys, keys, key_lens);
+            if (ret != UNIFYFS_SUCCESS) {
+                LOGERR("Error creating chunk reads for gfid=%d", last_gfid);
+                rc = ret;
+            }
 
-        /* create key to describe first byte we'll read */
-        unifyfs_keys[ndx]->fid = fid;
-        unifyfs_keys[ndx]->offset = eoff;
+            /* reset key counter for the current gfid */
+            num_keys = 0;
+        }
 
-        /* create key to describe last byte we'll read */
-        unifyfs_keys[ndx + 1]->fid = fid;
-        unifyfs_keys[ndx + 1]->offset = eoff + elen - 1;
+        /* get offset and length of current read request */
+        size_t off = unifyfs_Extent_offset(unifyfs_Extent_vec_at(extents, j));
+        size_t len = unifyfs_Extent_length(unifyfs_Extent_vec_at(extents, j));
+        LOGDBG("gfid:%d, offset:%zu, length:%zu", gfid, off, len);
+
+        /* Generate a pair of keys for each read request, representing
+         * the start and end offsets. MDHIM returns all key-value pairs that
+         * fall within the offset range.
+         *
+         * TODO: this is specific to the MDHIM in the source tree and not
+         *       portable to other KV-stores. This needs to be revisited to
+         *       utilize some other mechanism to retrieve all relevant KV
+         *       pairs from the KV-store.
+         */
+
+        /* split range of read request at boundaries used for
+         * MDHIM range query */
+        int used = split_request(&keys[num_keys], &key_lens[num_keys],
+            gfid, off, len);
+        num_keys += used;
+
+        /* keep track of the last gfid value that we processed */
+        last_gfid = gfid;
     }
 
-    int num_vals;
-    int rc = unifyfs_get_file_extents(key_cnt, unifyfs_keys, key_lens,
-                                      &num_vals, &keyvals);
-    /* TODO: if there are file extents not accounted for we should
-     * either return 0 for that data (holes) or EOF if reading past
-     * the end of the file */
-    if (UNIFYFS_SUCCESS != rc || num_vals == 0) {
-        /* failed to find any key / value pairs */
-        rc = UNIFYFS_FAILURE;
-    } else {
-        rc = create_request_messages(thrd_ctrl, cli_rank,
-                                     num_vals, keyvals);
+    /* create requests for all extents of final gfid */
+    ret = create_gfid_chunk_reads(thrd_ctrl, last_gfid,
+        app_id, client_id, num_keys, keys, key_lens);
+    if (ret != UNIFYFS_SUCCESS) {
+        LOGERR("Error creating chunk reads for gfid=%d", last_gfid);
+        rc = ret;
     }
 
-    // cleanup
-    free_key_array(unifyfs_keys);
+    /* free memory allocated for key storage */
+    free_key_array(keys);
     free(key_lens);
-    free(keyvals);
 
     return rc;
 }
@@ -983,16 +1482,11 @@ int rm_cmd_exit(reqmgr_thrd_t* thrd_ctrl)
     pthread_join(thrd_ctrl->thrd, &status);
     thrd_ctrl->exited = 1;
 
-    /* free storage holding shared data structures */
-    free(thrd_ctrl->del_req_set);
-    free(thrd_ctrl->del_req_stat->req_stat);
-    free(thrd_ctrl->del_req_stat);
-
     return UNIFYFS_SUCCESS;
 }
 
 /*
- * synchronize all the indices and file attributes
+ * synchronize all the indices
  * to the key-value store
  *
  * @param app_id: the application id
@@ -1002,152 +1496,120 @@ int rm_cmd_exit(reqmgr_thrd_t* thrd_ctrl)
  */
 int rm_cmd_fsync(int app_id, int client_side_id, int gfid)
 {
-    int ret = 0;
+    size_t i;
 
-    unifyfs_key_t** unifyfs_keys;
-    unifyfs_val_t** unifyfs_vals;
-    int* unifyfs_key_lens = NULL;
-    int* unifyfs_val_lens = NULL;
+    /* assume we'll succeed */
+    int ret = (int)UNIFYFS_SUCCESS;
 
-    fattr_key_t** fattr_keys = NULL;
-    unifyfs_file_attr_t** fattr_vals = NULL;
-    int* fattr_key_lens = NULL;
-    int* fattr_val_lens = NULL;
-    size_t i, attr_num_entries, extent_num_entries;
+    /* get memory page size on this machine */
+    int page_sz = getpagesize();
 
+    /* get app config struct for this client */
     app_config_t* app_config = (app_config_t*)
         arraylist_get(app_config_list, app_id);
 
-    extent_num_entries = *(size_t*)
-        (app_config->shm_superblocks[client_side_id]
-         + app_config->meta_offset);
+    /* get pointer to superblock for this client and app */
+    char* superblk = app_config->shm_superblocks[client_side_id];
 
-    /*
-     * indices are stored in the superblock shared memory
-     * created by the client
-     */
-    int page_sz = getpagesize();
-    unifyfs_index_t* meta_payload = (unifyfs_index_t*)
-        (app_config->shm_superblocks[client_side_id]
-         + app_config->meta_offset + page_sz);
+    /* get pointer to start of key/value region in superblock */
+    char* meta = superblk + app_config->meta_offset;
 
-    // allocate storage for values
-    // TODO: possibly get this from memory pool
-    unifyfs_keys = alloc_key_array(extent_num_entries);
-    unifyfs_vals = alloc_value_array(extent_num_entries);
-    unifyfs_key_lens = calloc(extent_num_entries, sizeof(int));
-    unifyfs_val_lens = calloc(extent_num_entries, sizeof(int));
-    if ((NULL == unifyfs_keys) ||
-        (NULL == unifyfs_vals) ||
-        (NULL == unifyfs_key_lens) ||
-        (NULL == unifyfs_val_lens)) {
+    /* get number of file extent index values client has for us,
+     * stored as a size_t value in meta region of shared memory */
+    size_t extent_num_entries = *(size_t*)(meta);
+
+    /* indices are stored in the superblock shared memory
+     * created by the client, these are stored as index_t
+     * structs starting one page size offset into meta region */
+    char* ptr_extents = meta + page_sz;
+
+    if (extent_num_entries == 0) {
+        /* Nothing to do */
+        return UNIFYFS_SUCCESS;
+    }
+
+    unifyfs_index_t* meta_payload = (unifyfs_index_t*)(ptr_extents);
+
+    /* total up number of key/value pairs we'll need for this
+     * set of index values */
+    size_t slices = 0;
+    for (i = 0; i < extent_num_entries; i++) {
+        size_t offset = meta_payload[i].file_pos;
+        size_t length = meta_payload[i].length;
+        slices += num_slices(offset, length);
+    }
+    if (slices >= UNIFYFS_MAX_SPLIT_CNT) {
+        LOGERR("Error allocating buffers");
         return (int)UNIFYFS_ERROR_NOMEM;
     }
 
-    // file extents
-    for (i = 0; i < extent_num_entries; i++) {
-        unifyfs_keys[i]->fid = meta_payload[i].fid;
-        unifyfs_keys[i]->offset = meta_payload[i].file_pos;
+    /* pointers to memory we'll dynamically allocate for file extents */
+    unifyfs_key_t** keys = NULL;
+    unifyfs_val_t** vals = NULL;
+    int* key_lens        = NULL;
+    int* val_lens        = NULL;
 
-        unifyfs_vals[i]->addr = meta_payload[i].mem_pos;
-        unifyfs_vals[i]->len = meta_payload[i].length;
-        unifyfs_vals[i]->delegator_rank = glb_mpi_rank;
-        unifyfs_vals[i]->app_id = app_id;
-        unifyfs_vals[i]->rank = client_side_id;
-
-        LOGDBG("extent - fid:%d, offset:%zu, length:%zu, app:%d, clid:%d",
-               unifyfs_keys[i]->fid, unifyfs_keys[i]->offset,
-               unifyfs_vals[i]->len, unifyfs_vals[i]->app_id,
-               unifyfs_vals[i]->rank);
-
-        unifyfs_key_lens[i] = sizeof(unifyfs_key_t);
-        unifyfs_val_lens[i] = sizeof(unifyfs_val_t);
-    }
-
-    ret = unifyfs_set_file_extents((int)extent_num_entries,
-                                   unifyfs_keys, unifyfs_key_lens,
-                                   unifyfs_vals, unifyfs_val_lens);
-    if (ret != UNIFYFS_SUCCESS) {
-        // TODO: need proper error handling
-        LOGERR("unifyfs_set_file_extents() failed");
-        goto rm_cmd_fsync_exit;
-    }
-
-    // file attributes
-    attr_num_entries = *(size_t*)
-        (app_config->shm_superblocks[client_side_id]
-         + app_config->fmeta_offset);
-
-    /*
-     * file attributes are stored in the superblock shared memory
-     * created by the client
-     */
-    unifyfs_file_attr_t* attr_payload = (unifyfs_file_attr_t*)
-        (app_config->shm_superblocks[client_side_id]
-         + app_config->fmeta_offset + page_sz);
-
-    // allocate storage for values
-    // TODO: possibly get this from memory pool
-    fattr_keys = alloc_attr_key_array(attr_num_entries);
-    fattr_vals = calloc(attr_num_entries, sizeof(unifyfs_file_attr_t*));
-    fattr_key_lens = calloc(attr_num_entries, sizeof(int));
-    fattr_val_lens = calloc(attr_num_entries, sizeof(int));
-    if ((NULL == fattr_keys) ||
-        (NULL == fattr_vals) ||
-        (NULL == fattr_key_lens) ||
-        (NULL == fattr_val_lens)) {
+    /* allocate storage for file extent key/values */
+    /* TODO: possibly get this from memory pool */
+    keys     = alloc_key_array(slices);
+    vals     = alloc_value_array(slices);
+    key_lens = calloc(slices, sizeof(int));
+    val_lens = calloc(slices, sizeof(int));
+    if ((NULL == keys) ||
+        (NULL == vals) ||
+        (NULL == key_lens) ||
+        (NULL == val_lens)) {
+        LOGERR("failed to allocate memory for file extents");
         ret = (int)UNIFYFS_ERROR_NOMEM;
         goto rm_cmd_fsync_exit;
     }
 
-    for (i = 0; i < attr_num_entries; i++) {
-        *fattr_keys[i] = attr_payload[i].gfid;
-        fattr_vals[i] = &(attr_payload[i]);
-        fattr_key_lens[i] = sizeof(fattr_key_t);
-        fattr_val_lens[i] = sizeof(fattr_val_t);
+    /* create file extent key/values for insertion into MDHIM */
+    int count = 0;
+    for (i = 0; i < extent_num_entries; i++) {
+        /* get file offset, length, and log offset for this entry */
+        unifyfs_index_t* meta = &meta_payload[i];
+        int gfid      = meta->gfid;
+        size_t offset = meta->file_pos;
+        size_t length = meta->length;
+        size_t logpos = meta->log_pos;
+
+        /* split this entry at the offset boundaries */
+        int used = split_index(
+            &keys[count], &vals[count], &key_lens[count], &val_lens[count],
+            gfid, offset, length, logpos,
+            glb_pmi_rank, app_id, client_side_id);
+
+        /* count up the number of keys we used for this index */
+        count += used;
     }
 
-    ret = unifyfs_set_file_attributes((int)attr_num_entries,
-                                      fattr_keys, fattr_key_lens,
-                                      fattr_vals, fattr_val_lens);
+    /* batch insert file extent key/values into MDHIM */
+    ret = unifyfs_set_file_extents((int)count,
+        keys, key_lens, vals, val_lens);
     if (ret != UNIFYFS_SUCCESS) {
-        // TODO: need proper error handling
+        /* TODO: need proper error handling */
+        LOGERR("unifyfs_set_file_extents() failed");
         goto rm_cmd_fsync_exit;
     }
 
 rm_cmd_fsync_exit:
-    // clean up memory
+    /* clean up memory */
 
-    if (NULL != unifyfs_keys) {
-        free_key_array(unifyfs_keys);
+    if (NULL != keys) {
+        free_key_array(keys);
     }
 
-    if (NULL != unifyfs_vals) {
-        free_value_array(unifyfs_vals);
+    if (NULL != vals) {
+        free_value_array(vals);
     }
 
-    if (NULL != unifyfs_key_lens) {
-        free(unifyfs_key_lens);
+    if (NULL != key_lens) {
+        free(key_lens);
     }
 
-    if (NULL != unifyfs_val_lens) {
-        free(unifyfs_val_lens);
-    }
-
-    if (NULL != fattr_keys) {
-        free_attr_key_array(fattr_keys);
-    }
-
-    if (NULL != fattr_vals) {
-        free(fattr_vals);
-    }
-
-    if (NULL != fattr_key_lens) {
-        free(fattr_key_lens);
-    }
-
-    if (NULL != fattr_val_lens) {
-        free(fattr_val_lens);
+    if (NULL != val_lens) {
+        free(val_lens);
     }
 
     return ret;
@@ -1156,65 +1618,6 @@ rm_cmd_fsync_exit:
 /************************
  * These functions define the logic of the request manager thread
  ***********************/
-
-/* pack the the requests to be sent to the same
- * delegator.
- * ToDo: pack and send multiple rounds if the
- * total request sizes is larger than REQ_BUF_LEN
- * @param rank: source rank that sends the requests
- * @param req_msg_buf: request buffer
- * @param req_num: number of read requests
- * @param *tot_sz: the total data size to read in these
- *  packed read requests
- * @return success/error code */
-static int rm_pack_send_requests(
-    char* req_msg_buf,      /* pointer to buffer to pack requests into */
-    send_msg_t* send_metas, /* request objects to be packed */
-    int req_cnt,            /* number of requests */
-    size_t* tot_sz)         /* total data payload size we're requesting */
-{
-    /* tot_sz records the aggregate data size
-     * requested in this transfer */
-
-    /* send format:
-     *   (int) cmd - specifies type of message (SVC_CMD_RDREQ_MSG)
-     *   (int) req_num - number of requests in message
-     *   {sequence of send_meta_t requests} */
-    size_t packed_size = (2 * sizeof(int)) + (req_cnt * sizeof(send_msg_t));
-
-    /* get pointer to start of send buffer */
-    char* ptr = req_msg_buf;
-    memset(ptr, 0, packed_size);
-
-    /* pack command */
-    int cmd = (int)SVC_CMD_RDREQ_MSG;
-    *((int*)ptr) = cmd;
-    ptr += sizeof(int);
-
-    /* pack request count */
-    *((int*)ptr) = req_cnt;
-    ptr += sizeof(int);
-
-    /* pack each request into the send buffer,
-     * total up incoming bytes as we go */
-    int i;
-    size_t bytes = 0;
-    for (i = 0; i < req_cnt; i++) {
-        /* accumulate data size of this request */
-        bytes += send_metas[i].length;
-    }
-
-    /* copy requests into buffer */
-    memcpy(ptr, send_metas, (req_cnt * sizeof(send_msg_t)));
-    ptr += (req_cnt * sizeof(send_msg_t));
-
-    /* increment running total size of data bytes */
-    (*tot_sz) += bytes;
-
-    /* return number of bytes used to pack requests */
-    assert(packed_size == (ptr - req_msg_buf));
-    return (int)packed_size;
-}
 
 /* pack the chunk read requests for a single remote delegator.
  *
@@ -1232,6 +1635,8 @@ static size_t rm_pack_chunk_requests(char* req_msg_buf,
     int req_cnt = remote_reads->num_chunks;
     size_t reqs_sz = req_cnt * sizeof(chunk_read_req_t);
     size_t packed_size = (2 * sizeof(int)) + sizeof(size_t) + reqs_sz;
+
+    assert(req_cnt < MAX_META_PER_SEND);
 
     /* get pointer to start of send buffer */
     char* ptr = req_msg_buf;
@@ -1258,67 +1663,6 @@ static size_t rm_pack_chunk_requests(char* req_msg_buf,
     return packed_size;
 }
 
-/* send the read requests to the remote delegator service managers
- * @param thrd_ctrl : reqmgr thread control structure
- * @param tot_sz    : output parameter for total size of data to read
- * @return success/error code */
-static int rm_send_remote_requests(reqmgr_thrd_t* thrd_ctrl,
-                                   size_t* tot_sz)
-{
-    // NOTE: this fn assumes thrd_ctrl->thrd_lock is locked
-
-    int rc;
-    int i = 0;
-
-    /* ToDo: Transfer the message in multiple
-     * rounds when total size > the size of
-     * send_msg_buf
-     * */
-
-    /* use this variable to total up number of incoming data bytes */
-    *tot_sz = 0;
-
-    /* get pointer to send buffer */
-    char* sendbuf = thrd_ctrl->del_req_msg_buf;
-
-    /* get pointer to start of read request array,
-     * and initialize index to point to first element */
-    send_msg_t* msgs = thrd_ctrl->del_req_set->msg_meta;
-    int msg_cursor = 0;
-
-    /* iterate over each delegator we need to send requests to */
-    for (i = 0; i < thrd_ctrl->del_req_stat->del_cnt; i++) {
-        /* pointer to start of requests for this delegator */
-        send_msg_t* reqs = msgs + msg_cursor;
-
-        /* number of requests for this delegator */
-        int req_num = thrd_ctrl->del_req_stat->req_stat[i].req_cnt;
-
-        /* pack requests into send buffer, get size of packed data,
-         * increase total number of data payload we will get back */
-        int packed_size = rm_pack_send_requests(sendbuf, reqs,
-                                                req_num, tot_sz);
-
-        /* get rank of target delegator */
-        int del_rank = thrd_ctrl->del_req_stat->req_stat[i].del_id;
-
-        /* send requests */
-        //MPI_Send(sendbuf, packed_size, MPI_BYTE,
-        //         del_rank, (int)READ_REQUEST_TAG, MPI_COMM_WORLD);
-        rc = invoke_server_request_rpc(del_rank, 0, (int)READ_REQUEST_TAG,
-                                       (void*)sendbuf, (size_t)packed_size);
-        if (rc != (int)UNIFYFS_SUCCESS) {
-            LOGERR("server request rpc to %d failed - %s", del_rank,
-                   unifyfs_error_enum_str((unifyfs_error_e)rc));
-        }
-
-        /* advance to requests for next delegator */
-        msg_cursor += req_num;
-    }
-
-    return UNIFYFS_SUCCESS;
-}
-
 /* send the chunk read requests to remote delegators
  *
  * @param thrd_ctrl : reqmgr thread control structure
@@ -1340,7 +1684,7 @@ static int rm_request_remote_chunks(reqmgr_thrd_t* thrd_ctrl)
         if (req->num_remote_reads > 0) {
             LOGDBG("read req %d is active", i);
             debug_print_read_req(req);
-            if (req->status == READREQ_INIT) {
+            if (req->status == READREQ_READY) {
                 req->status = READREQ_STARTED;
                 /* iterate over each delegator we need to send requests to */
                 remote_chunk_reads_t* remote_reads;
@@ -1372,6 +1716,10 @@ static int rm_request_remote_chunks(reqmgr_thrd_t* thrd_ctrl)
             } else {
                 /* already started */
                 LOGDBG("read req %d already processed", i);
+            }
+        } else if (req->num_remote_reads == 0) {
+            if (req->status == READREQ_READY) {
+                req->status = READREQ_STARTED;
             }
         }
     }
@@ -1411,57 +1759,37 @@ static int rm_process_remote_chunk_responses(reqmgr_thrd_t* thrd_ctrl)
                     ret = rc;
                 }
             }
+        } else if ((req->num_remote_reads == 0) &&
+                   (req->status == READREQ_STARTED)) {
+            /* look up client shared memory region */
+            app_config_t* app_config =
+                (app_config_t*) arraylist_get(app_config_list, req->app_id);
+            assert(NULL != app_config);
+            shm_header_t* client_shm =
+                (shm_header_t*) app_config->shm_recv_bufs[req->client_id];
+
+            RM_LOCK(thrd_ctrl);
+
+            /* mark request as complete */
+            req->status = READREQ_COMPLETE;
+
+            /* signal client that we're now done writing data */
+            client_signal(client_shm, SHMEM_REGION_DATA_COMPLETE);
+
+            /* wait for client to read data */
+            client_wait(client_shm);
+
+            rc = release_read_req(thrd_ctrl, req);
+            if (rc != (int)UNIFYFS_SUCCESS) {
+                LOGERR("failed to release server_read_req_t");
+                ret = rc;
+            }
+
+            RM_UNLOCK(thrd_ctrl);
         }
     }
 
     return ret;
-}
-
-/* signal the client process for it to start processing read
- * data in shared memory */
-static int client_signal(shm_header_t* hdr,
-                         shm_region_state_e flag)
-{
-    if (flag == SHMEM_REGION_DATA_READY) {
-        LOGDBG("setting data-ready");
-    } else if (flag == SHMEM_REGION_DATA_COMPLETE) {
-        LOGDBG("setting data-complete");
-    }
-    hdr->state = flag;
-    /* TODO: MEM_FLUSH */
-    return UNIFYFS_SUCCESS;
-}
-
-/* wait until client has processed all read data in shared memory */
-static int client_wait(shm_header_t* hdr)
-{
-    int rc = (int)UNIFYFS_SUCCESS;
-
-    /* specify time to sleep between checking flag in shared
-     * memory indicating client has processed data */
-    struct timespec shm_wait_tm;
-    shm_wait_tm.tv_sec  = 0;
-    shm_wait_tm.tv_nsec = SHM_WAIT_INTERVAL;
-
-    /* wait for client to set flag to 0 */
-    int max_sleep = 10000000; // 10s
-    volatile int* vip = (volatile int*)&(hdr->state);
-    while (*vip != SHMEM_REGION_EMPTY) {
-        /* not there yet, sleep for a while */
-        nanosleep(&shm_wait_tm, NULL);
-        /* TODO: MEM_FETCH */
-        max_sleep--;
-        if (0 == max_sleep) {
-            LOGERR("timed out waiting for empty");
-            rc = (int)UNIFYFS_ERROR_SHMEM;
-            break;
-        }
-    }
-
-    /* reset header to reflect empty state */
-    hdr->meta_cnt = 0;
-    hdr->bytes = 0;
-    return rc;
 }
 
 static shm_meta_t* reserve_shmem_meta(app_config_t* app_config,
@@ -1502,172 +1830,6 @@ static shm_meta_t* reserve_shmem_meta(app_config_t* app_config,
     return meta;
 }
 
-/* parse the read replies from message received from service manager,
- * deliver replies back to client
- *
- * @param app_id       : application id
- * @param client_id    : local client rank within app
- * @param recv_msg_buf : message buffer containing packed read requests
- * @param ptr_tot_sz   : pointer to total processed data size
- * @return success/error code */
-static int rm_process_received_msg(int app_id,
-                                   int client_id,
-                                   char* recv_msg_buf,
-                                   size_t* ptr_tot_sz)
-{
-    /* assume we'll succeed in processing the message */
-    int rc = UNIFYFS_SUCCESS;
-
-    /* look up client app config based on client id */
-    app_config_t* app_config =
-        (app_config_t*)arraylist_get(app_config_list, app_id);
-
-    /* format of read replies in shared memory
-     *   shm_header_t - shared memory region header
-     *   {sequence of shm_meta_t + data payload} */
-
-    /* get pointer to shared memory buffer for this client */
-    size_t header_size = sizeof(shm_header_t);
-    shm_header_t* hdr = (shm_header_t*)app_config->shm_recv_bufs[client_id];
-
-    /* format of recv_msg_buf:
-     *   (int) num - number of read replies packed in message
-     *   {sequence of recv_msg_t containing read replies} */
-
-    /* get pointer to start of receive buffer */
-    char* msgptr = recv_msg_buf;
-
-    /* extract number of read requests in this message */
-    int num = *(int*)msgptr;
-    msgptr += sizeof(int);
-
-    /* unpack each read reply */
-    int j;
-    for (j = 0; j < num; j++) {
-        /* point to first read reply in message */
-        recv_msg_t* msg = (recv_msg_t*)msgptr;
-        msgptr += sizeof(recv_msg_t);
-
-        /* get pointer in shared memory for next read reply */
-        shm_meta_t* meta = reserve_shmem_meta(app_config, hdr, msg->length);
-        if (NULL == meta) {
-            LOGERR("failed to reserve space for read reply");
-            rc = UNIFYFS_FAILURE;
-            break;
-        }
-        char* shmbuf = ((char*)meta) + sizeof(shm_meta_t);
-
-        /* copy in header for this read request */
-        meta->gfid    = msg->src_fid;
-        meta->offset  = msg->src_offset;
-        meta->length  = msg->length;
-        meta->errcode = msg->errcode;
-
-        /* copy data for this read request */
-        memcpy(shmbuf, msgptr, msg->length);
-
-        /* advance to next read reply in message buffer */
-        msgptr += msg->length;
-
-        /* decrement number of bytes processed from total */
-        if (NULL != ptr_tot_sz) {
-            *ptr_tot_sz -= msg->length;
-            LOGDBG("processed message of size %zu, %zu left to receive",
-                   msg->length, *ptr_tot_sz);
-        }
-    }
-
-    return rc;
-}
-
-/* receive the requested data returned from service managers
- * as a result of the read requests we sent to them
- *
- * @param thrd_ctrl: request manager thread state
- * @param tot_sz:    total data size to receive (excludes header bytes)
- * @return success/error code */
-static int rm_receive_remote_message(reqmgr_thrd_t* thrd_ctrl,
-                                     size_t tot_sz)
-{
-    // NOTE: this fn assumes thrd_ctrl->thrd_lock is locked
-
-    /* assume we'll succeed */
-    int rc = UNIFYFS_SUCCESS;
-
-    /* get app id and client id that we'll be serving,
-     * app id associates thread with a namespace (mountpoint)
-     * the client id associates the thread with a particular
-     * client process id */
-    int app_id    = thrd_ctrl->app_id;
-    int client_id = thrd_ctrl->client_id;
-
-    /* lookup our data structure for this app id */
-    app_config_t* app_config =
-        (app_config_t*)arraylist_get(app_config_list, app_id);
-
-    /* get thread id for this client (used for MPI tags) */
-    int thrd_id = app_config->thrd_idxs[client_id];
-
-    /* service manager will incorporate our thread id in tag,
-     * to distinguish between target request manager threads */
-    int tag = (int)READ_RESPONSE_TAG + thrd_id;
-
-    /* array of MPI_Request objects for window of posted receives */
-    MPI_Request recv_req[RECV_BUF_CNT] = {MPI_REQUEST_NULL};
-
-    /* get number of receives to post and size of each buffer */
-    int recv_buf_cnt = RECV_BUF_CNT;
-    int recv_buf_len = (int) SENDRECV_BUF_LEN;
-
-    /* post a window of receive buffers for incoming data */
-    int i;
-    for (i = 0; i < recv_buf_cnt; i++) {
-        /* post buffer for incoming receive */
-        MPI_Irecv(thrd_ctrl->del_recv_msg_buf[i], recv_buf_len, MPI_BYTE,
-                  MPI_ANY_SOURCE, tag, MPI_COMM_WORLD, &recv_req[i]);
-    }
-
-    /* spin until we have received all incoming data */
-    while (tot_sz > 0) {
-        /* wait for any receive to come in */
-        int index;
-        MPI_Status status;
-        MPI_Waitany(recv_buf_cnt, recv_req, &index, &status);
-
-        /* got a new message, get pointer to message buffer */
-        char* buf = thrd_ctrl->del_recv_msg_buf[index];
-
-        /* unpack the data into client shared memory,
-         * this will internally signal client and wait
-         * for data to be processed if shared memory
-         * buffer is filled */
-        int tmp_rc = rm_process_received_msg(app_id, client_id, buf, &tot_sz);
-        if (tmp_rc != UNIFYFS_SUCCESS) {
-            rc = tmp_rc;
-        }
-
-        /* done processing, repost this receive buffer */
-        MPI_Irecv(thrd_ctrl->del_recv_msg_buf[index], recv_buf_len, MPI_BYTE,
-                  MPI_ANY_SOURCE, tag, MPI_COMM_WORLD, &recv_req[index]);
-    }
-
-    /* cancel posted MPI receives */
-    for (i = 0; i < recv_buf_cnt; i++) {
-        MPI_Status status;
-        MPI_Cancel(&recv_req[i]);
-        MPI_Wait(&recv_req[i], &status);
-    }
-
-    /* signal client that we're now done writing data */
-    shm_header_t* hdr = (shm_header_t*)app_config->shm_recv_bufs[client_id];
-    client_signal(hdr, SHMEM_REGION_DATA_COMPLETE);
-
-    /* wait for client to read data */
-    client_wait(hdr);
-
-    return rc;
-}
-
 int rm_post_chunk_read_responses(int app_id,
                                  int client_id,
                                  int src_rank,
@@ -1676,29 +1838,31 @@ int rm_post_chunk_read_responses(int app_id,
                                  size_t bulk_sz,
                                  char* resp_buf)
 {
-    int rc, thrd_id;
-    app_config_t* app_config = NULL;
-    reqmgr_thrd_t* thrd_ctrl = NULL;
-    server_read_req_t* rdreq = NULL;
-    remote_chunk_reads_t* del_reads = NULL;
+    int rc;
 
     /* lookup RM thread control structure for this app id */
-    app_config = (app_config_t*) arraylist_get(app_config_list, app_id);
+    app_config_t* app_config = (app_config_t*)
+        arraylist_get(app_config_list, app_id);
     assert(NULL != app_config);
-    thrd_id = app_config->thrd_idxs[client_id];
-    thrd_ctrl = rm_get_thread(thrd_id);
+
+    int thrd_id = app_config->thrd_idxs[client_id];
+
+    reqmgr_thrd_t* thrd_ctrl = rm_get_thread(thrd_id);
     assert(NULL != thrd_ctrl);
 
     RM_LOCK(thrd_ctrl);
 
+    remote_chunk_reads_t* del_reads = NULL;
+
     /* find read req associated with req_id */
-    rdreq = thrd_ctrl->read_reqs + req_id;
+    server_read_req_t* rdreq = thrd_ctrl->read_reqs + req_id;
     for (int i = 0; i < rdreq->num_remote_reads; i++) {
         if (rdreq->remote_reads[i].rank == src_rank) {
             del_reads = rdreq->remote_reads + i;
             break;
         }
     }
+
     if (NULL != del_reads) {
         LOGDBG("posting chunk responses for req %d from delegator %d",
                req_id, src_rank);
@@ -1837,16 +2001,11 @@ int rm_handle_chunk_read_responses(reqmgr_thrd_t* thrd_ctrl,
     return ret;
 }
 
-/* entry point for request manager thread, one thread is created
- * for each client process, client informs thread of a set of read
- * requests, thread retrieves data for client and notifies client
- * when data is ready
+/* Entry point for request manager thread. One thread is created
+ * for each client process to retrieve remote data and notify the
+ * client when data is ready.
  *
- * delegate the read requests for the delegator thread's client. Each
- * delegator thread handles one connection to one client-side rank.
- *
- * @param arg: pointer to control structure for the delegator thread
- *
+ * @param arg: pointer to RM thread control structure
  * @return NULL */
 void* rm_delegate_request_thread(void* arg)
 {
@@ -1904,25 +2063,6 @@ void* rm_delegate_request_thread(void* arg)
             LOGERR("failed to request remote chunks");
         }
 
-        /* tot_sz tracks the total bytes we expect to receive.
-         * size is computed during send, decremented during receive */
-        size_t tot_sz = 0;
-        rc = rm_send_remote_requests(thrd_ctrl, &tot_sz);
-        if (rc != UNIFYFS_SUCCESS) {
-            /* release lock and exit if we hit an error */
-            RM_UNLOCK(thrd_ctrl);
-            return NULL;
-        }
-        if (tot_sz > 0) {
-            /* wait for data to come back from servers */
-            rc = rm_receive_remote_message(thrd_ctrl, tot_sz);
-            if (rc != UNIFYFS_SUCCESS) {
-                /* release lock and exit if we hit an error */
-                RM_UNLOCK(thrd_ctrl);
-                return NULL;
-            }
-        }
-
         /* release lock */
         RM_UNLOCK(thrd_ctrl);
     }
@@ -1934,6 +2074,7 @@ void* rm_delegate_request_thread(void* arg)
 
 /* BEGIN MARGO SERVER-SERVER RPC INVOCATION FUNCTIONS */
 
+#if 0 // DISABLE UNUSED RPCS
 /* invokes the server_hello rpc */
 int invoke_server_hello_rpc(int dst_srvr_rank)
 {
@@ -1954,7 +2095,7 @@ int invoke_server_hello_rpc(int dst_srvr_rank)
 
     /* fill in input struct */
     snprintf(hello_msg, sizeof(hello_msg), "hello from %s", glb_host);
-    in.src_rank = (int32_t)glb_mpi_rank;
+    in.src_rank = (int32_t)glb_pmi_rank;
     in.message_str = strdup(hello_msg);
 
     LOGDBG("invoking the server-hello rpc function");
@@ -1992,11 +2133,9 @@ int invoke_server_request_rpc(int dst_srvr_rank, int req_id, int tag,
     hg_addr_t dst_srvr_addr;
     hg_size_t bulk_sz = buf_sz;
 
-    if (dst_srvr_rank == glb_mpi_rank) {
+    if (dst_srvr_rank == glb_pmi_rank) {
         // short-circuit for local requests
-        if (tag == (int)READ_REQUEST_TAG) {
-            return sm_decode_msg((char*)data_buf);
-        }
+        return rc;
     }
 
     assert(dst_srvr_rank < (int)glb_num_servers);
@@ -2007,7 +2146,7 @@ int invoke_server_request_rpc(int dst_srvr_rank, int req_id, int tag,
     assert(hret == HG_SUCCESS);
 
     /* fill in input struct */
-    in.src_rank = (int32_t)glb_mpi_rank;
+    in.src_rank = (int32_t)glb_pmi_rank;
     in.req_id = (int32_t)req_id;
     in.req_tag = (int32_t)tag;
     in.bulk_size = bulk_sz;
@@ -2040,6 +2179,7 @@ int invoke_server_request_rpc(int dst_srvr_rank, int req_id, int tag,
 
     return rc;
 }
+#endif // DISABLE UNUSED RPCS
 
 /* invokes the server_request rpc */
 int invoke_chunk_read_request_rpc(int dst_srvr_rank,
@@ -2055,9 +2195,9 @@ int invoke_chunk_read_request_rpc(int dst_srvr_rank,
     hg_addr_t dst_srvr_addr;
     hg_size_t bulk_sz = buf_sz;
 
-    if (dst_srvr_rank == glb_mpi_rank) {
+    if (dst_srvr_rank == glb_pmi_rank) {
         // short-circuit for local requests
-        return sm_issue_chunk_reads(glb_mpi_rank,
+        return sm_issue_chunk_reads(glb_pmi_rank,
                                     rdreq->app_id,
                                     rdreq->client_id,
                                     rdreq->req_ndx,
@@ -2074,7 +2214,7 @@ int invoke_chunk_read_request_rpc(int dst_srvr_rank,
     assert(hret == HG_SUCCESS);
 
     /* fill in input struct */
-    in.src_rank = (int32_t)glb_mpi_rank;
+    in.src_rank = (int32_t)glb_pmi_rank;
     in.app_id = (int32_t)rdreq->app_id;
     in.client_id = (int32_t)rdreq->client_id;
     in.req_id = (int32_t)rdreq->req_ndx;
@@ -2115,63 +2255,86 @@ int invoke_chunk_read_request_rpc(int dst_srvr_rank,
 /* handler for remote read request response */
 static void chunk_read_response_rpc(hg_handle_t handle)
 {
-    int rc, src_rank, req_id;
-    int app_id, client_id, thrd_id;
-    int i, num_chks;
     int32_t ret;
     hg_return_t hret;
-    hg_bulk_t bulk_handle;
-    size_t bulk_sz;
-    chunk_read_response_in_t in;
-    chunk_read_response_out_t out;
-    void* resp_buf = NULL;
 
     /* get input params */
-    rc = margo_get_input(handle, &in);
+    chunk_read_response_in_t in;
+    int rc = margo_get_input(handle, &in);
     assert(rc == HG_SUCCESS);
-    src_rank = (int)in.src_rank;
-    app_id = (int)in.app_id;
-    client_id = (int)in.client_id;
-    req_id = (int)in.req_id;
-    num_chks = (int)in.num_chks;
-    bulk_sz = (size_t)in.bulk_size;
 
+    /* extract params from input struct */
+    int src_rank   = (int)in.src_rank;
+    int app_id     = (int)in.app_id;
+    int client_id  = (int)in.client_id;
+    int req_id     = (int)in.req_id;
+    int num_chks   = (int)in.num_chks;
+    size_t bulk_sz = (size_t)in.bulk_size;
+
+    /* The input parameters specify the info for a bulk transfer
+     * buffer on the sending process.  We use that info to pull data
+     * from the sender into a local buffer.  This buffer contains
+     * the read reply headers and associated read data for requests
+     * we had sent earlier. */
+
+    /* pull the remote data via bulk transfer */
     if (0 == bulk_sz) {
+        /* sender is trying to send an empty buffer,
+         * don't think that should happen unless maybe
+         * we had sent a read request list that was empty? */
         LOGERR("empty response buffer");
         ret = (int32_t)UNIFYFS_ERROR_INVAL;
     } else {
-        resp_buf = malloc(bulk_sz);
+        /* allocate a buffer to hold the incoming data */
+        char* resp_buf = (char*) malloc(bulk_sz);
         if (NULL == resp_buf) {
+            /* allocation failed, that's bad */
             LOGERR("failed to allocate chunk read responses buffer");
             ret = (int32_t)UNIFYFS_ERROR_NOMEM;
         } else {
-            /* pull response data */
+            /* got a buffer, now pull response data */
             ret = (int32_t)UNIFYFS_SUCCESS;
+
+            /* get margo info */
             const struct hg_info* hgi = margo_get_info(handle);
             assert(NULL != hgi);
+
             margo_instance_id mid = margo_hg_info_get_instance(hgi);
             assert(mid != MARGO_INSTANCE_NULL);
-            hret = margo_bulk_create(mid, 1, &resp_buf, &in.bulk_size,
-                                     HG_BULK_WRITE_ONLY, &bulk_handle);
-            assert(hret == HG_SUCCESS);
-            hret = margo_bulk_transfer(mid, HG_BULK_PULL, hgi->addr,
-                                       in.bulk_handle, 0,
-                                       bulk_handle, 0, in.bulk_size);
+
+            /* pass along address of buffer we want to transfer
+             * data into to prepare it for a bulk write,
+             * get resulting margo handle */
+            hg_bulk_t bulk_handle;
+            hret = margo_bulk_create(mid, 1, (void**)&resp_buf, &in.bulk_size,
+                HG_BULK_WRITE_ONLY, &bulk_handle);
             assert(hret == HG_SUCCESS);
 
+            /* execute the transfer to pull data from remote side
+             * into our local bulk transfer buffer */
+            hret = margo_bulk_transfer(mid, HG_BULK_PULL, hgi->addr,
+                in.bulk_handle, 0, bulk_handle, 0, in.bulk_size);
+            assert(hret == HG_SUCCESS);
+
+            /* process read replies (headers and data) we just
+             * received */
             rc = rm_post_chunk_read_responses(app_id, client_id,
-                                              src_rank, req_id, num_chks,
-                                              bulk_sz, (char*)resp_buf);
+                src_rank, req_id, num_chks, bulk_sz, resp_buf);
             if (rc != (int)UNIFYFS_SUCCESS) {
                 LOGERR("failed to handle chunk read responses")
                 ret = rc;
             }
+
+            /* deregister our bulk transfer buffer */
             margo_bulk_free(bulk_handle);
         }
     }
 
-    /* fill output structure and return to caller */
+    /* fill output structure */
+    chunk_read_response_out_t out;
     out.ret = ret;
+
+    /* return to caller */
     hret = margo_respond(handle, &out);
     assert(hret == HG_SUCCESS);
 

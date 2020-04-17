@@ -96,6 +96,7 @@
 #include "unifyfs_log.h"
 #include "unifyfs_meta.h"
 #include "unifyfs_shm.h"
+#include "seg_tree.h"
 
 // client headers
 #include "unifyfs.h"
@@ -204,6 +205,7 @@ typedef struct {
     off_t pos;   /* current file pointer */
     int   read;  /* whether file is opened for read */
     int   write; /* whether file is opened for write */
+    int   append; /* whether file is opened for append */
 } unifyfs_fd_t;
 
 enum unifyfs_stream_orientation {
@@ -251,10 +253,7 @@ enum flock_enum {
     SH_LOCKED
 };
 
-/* TODO: make this an enum */
-#define FILE_STORAGE_NULL        0
-#define FILE_STORAGE_FIXED_CHUNK 1
-#define FILE_STORAGE_LOGIO       2
+enum {FILE_STORAGE_NULL = 0, FILE_STORAGE_LOGIO};
 
 /* TODO: make this an enum */
 #define CHUNK_LOCATION_NULL      0
@@ -267,21 +266,27 @@ typedef struct {
 } unifyfs_chunkmeta_t;
 
 typedef struct {
-    off_t size;                      /* current file size */
-    off_t log_size;                  /* real size of the file for logio*/
-    pthread_spinlock_t fspinlock;    /* file lock variable */
-    enum flock_enum flock_status;    /* file lock status */
+    off_t global_size;            /* Global size of the file */
+    off_t local_size;             /* Local size of the file */
+    off_t log_size;               /* Log size.  This is the sum of all the
+                                   * write counts. */
+    pthread_spinlock_t fspinlock; /* file lock variable */
+    enum flock_enum flock_status; /* file lock status */
 
-    int storage;                     /* FILE_STORAGE type */
+    int storage;                  /* FILE_STORAGE type */
 
-    int needs_sync;                  /* have unsynced writes */
+    int gfid;                     /* global file id for this file */
+    int needs_sync;               /* have unsynced writes */
 
-    off_t chunks;                   /* number of chunks allocated to file */
-    off_t chunkmeta_idx;            /* starting index in unifyfs_chunkmeta */
-    int is_laminated;               /* Is this file laminated */
-    uint32_t mode;                  /* st_mode bits.  This has file
-                                     * permission info and will tell you if this
-                                     * is a regular file or directory. */
+    off_t chunks;                 /* number of chunks allocated to file */
+    off_t chunkmeta_idx;          /* starting index in unifyfs_chunkmeta */
+    int is_laminated;             /* Is this file laminated */
+    uint32_t mode;                /* st_mode bits.  This has file
+                                   * permission info and will tell you if this
+                                   * is a regular file or directory. */
+    struct seg_tree extents_sync; /* Segment tree containing our coalesced
+                                   * writes between sync operations */
+    struct seg_tree extents;      /* Segment tree of all local data extents */
 } unifyfs_filemeta_t;
 
 /* struct used to map a full path to its local file id,
@@ -296,12 +301,23 @@ typedef struct {
 } unifyfs_filename_t;
 
 /*unifyfs structures*/
+
+/* This structure defines a client read request for a file.
+ * It is initialized by the client describing the global file id,
+ * offset, and length to be read and provides a pointer to
+ * the user buffer where the data should be placed.  The
+ * server sets the errcode field to UNIFYFS_SUCCESS if the read
+ * succeeds and otherwise records an error code pertaining to
+ * why the read failed.  The server records the number of bytes
+ * read in the nread field, which the client can use to detect
+ * short read operations. */
 typedef struct {
-    int fid;
-    int errcode;
-    size_t offset;
-    size_t length;
-    char* buf;
+    int gfid;      /* global file id to be read */
+    int errcode;   /* error code for read operation if any */
+    size_t offset; /* logical offset in file to read from */
+    size_t length; /* number of bytes to read */
+    size_t nread;  /* number of bytes actually read */
+    char* buf;     /* pointer to user buffer to place data */
 } read_req_t;
 
 typedef struct {
@@ -309,24 +325,12 @@ typedef struct {
     unifyfs_index_t* index_entry;
 } unifyfs_index_buf_t;
 
-typedef struct {
-    size_t* ptr_num_entries;
-    unifyfs_file_attr_t* meta_entry;
-} unifyfs_fattr_buf_t;
-
-typedef struct {
-    unifyfs_index_t idxes[UNIFYFS_MAX_SPLIT_CNT];
-    int count;
-} index_set_t;
-
-typedef struct {
-    read_req_t read_reqs[UNIFYFS_MAX_READ_CNT];
-    int count;
-} read_req_set_t;
-
 extern unifyfs_index_buf_t unifyfs_indices;
 extern unsigned long unifyfs_max_index_entries;
 extern long unifyfs_spillover_max_chunks;
+
+/* tracks total number of unsync'd segments for all files */
+extern unsigned long unifyfs_segment_count;
 
 extern int local_rank_cnt;
 extern int local_rank_idx;
@@ -335,8 +339,6 @@ extern int client_sockfd;
 extern struct pollfd cmd_fd;
 extern void* shm_req_buf;
 extern void* shm_recv_buf;
-extern char cmd_buf[CMD_BUF_SIZE];
-extern unifyfs_fattr_buf_t unifyfs_fattrs;
 
 extern int app_id;
 extern size_t unifyfs_key_slice_range;
@@ -392,6 +394,8 @@ extern int unifyfs_use_memfs;
 extern int unifyfs_use_spillover;
 
 extern int    unifyfs_max_files;  /* maximum number of files to store */
+extern bool   unifyfs_flatten_writes; /* enable write flattening */
+extern bool   unifyfs_local_extents;  /* enable tracking of local extents */
 extern size_t
 unifyfs_chunk_mem;  /* number of bytes in memory to be used for chunk storage */
 extern int    unifyfs_chunk_bits; /* we set chunk size = 2^unifyfs_chunk_bits */
@@ -405,7 +409,7 @@ extern void* free_chunk_stack;
 extern void* free_spillchunk_stack;
 extern char* unifyfs_chunks;
 extern unifyfs_chunkmeta_t* unifyfs_chunkmetas;
-int unifyfs_spilloverblock;
+extern int unifyfs_spilloverblock;
 
 /* -------------------------------
  * Common functions
@@ -470,8 +474,21 @@ unifyfs_fd_t* unifyfs_get_filedesc_from_fd(int fd);
  * otherwise return NULL */
 unifyfs_filemeta_t* unifyfs_get_meta_from_fid(int fid);
 
+/* Return 1 if fid is laminated, 0 if not */
+int unifyfs_fid_is_laminated(int fid);
+
+/* Return 1 if fd is laminated, 0 if not */
+int unifyfs_fd_is_laminated(int fd);
+
 /* Given a fid, return the path.  */
 const char* unifyfs_path_from_fid(int fid);
+
+/* Given a fid, return a gfid */
+int unifyfs_gfid_from_fid(const int fid);
+
+/* returns fid for corresponding gfid, if one is active,
+ * returns -1 otherwise */
+int unifyfs_fid_from_gfid(const int gfid);
 
 /* given an UNIFYFS error code, return corresponding errno code */
 int unifyfs_err_map_to_errno(int rc);
@@ -492,14 +509,23 @@ int unifyfs_fid_is_dir(int fid);
  * returns 0 for no */
 int unifyfs_fid_is_dir_empty(const char* path);
 
-/* return current size of given file id */
-off_t unifyfs_fid_size(int fid);
+/* Return current global size of given file id */
+off_t unifyfs_fid_global_size(int fid);
 
-/* fill in limited amount of stat information for global file id */
-int unifyfs_gfid_stat(int gfid, struct stat* buf);
+/* Return current local size of given file id */
+off_t unifyfs_fid_local_size(int fid);
 
-/* fill in limited amount of stat information */
-int unifyfs_fid_stat(int fid, struct stat* buf);
+/* Return current local size of given file id */
+off_t unifyfs_fid_log_size(int fid);
+
+/*
+ * Return current size of given file id.  If the file is laminated, return the
+ * global size.  Otherwise, return the local size.
+ */
+off_t unifyfs_fid_logical_size(int fid);
+
+/* Update local metadata for file from global metadata */
+int unifyfs_fid_update_file_meta(int fid, unifyfs_file_attr_t* gfattr);
 
 /* allocate a file id slot for a new file
  * return the fid or -1 on error */
@@ -556,10 +582,18 @@ int unifyfs_fid_unlink(int fid);
 
 int unifyfs_generate_gfid(const char* path);
 
-int unifyfs_set_global_file_meta(int fid, int gfid);
+int unifyfs_set_global_file_meta_from_fid(
+    int fid,
+    int create);
 
-int unifyfs_get_global_file_meta(int fid, int gfid,
-                                 unifyfs_file_attr_t* gfattr);
+int unifyfs_set_global_file_meta(
+    int gfid,
+    int create,
+    unifyfs_file_attr_t* gfattr);
+
+int unifyfs_get_global_file_meta(
+    int gfid,
+    unifyfs_file_attr_t* gfattr);
 
 // These require types/structures defined above
 #include "unifyfs-fixed.h"

@@ -40,8 +40,11 @@
  * Please also read this file LICENSE.CRUISE
  */
 
+#include "unifyfs-internal.h"
 #include "unifyfs-fixed.h"
 #include "unifyfs_log.h"
+#include "margo_client.h"
+#include "seg_tree.h"
 
 static inline
 unifyfs_chunkmeta_t* filemeta_get_chunkmeta(const unifyfs_filemeta_t* meta,
@@ -264,77 +267,248 @@ static int unifyfs_chunk_read(
     return UNIFYFS_SUCCESS;
 }
 
-/* given an index, split it into multiple indices whose range is equal or
- * smaller than slice_range size @param cur_idx: the index to split
- * @param slice_range: the slice size of the key-value store
- * @return index_set: the set of split indices */
-int unifyfs_split_index(unifyfs_index_t* cur_idx, index_set_t* index_set,
-                        long slice_range)
+/* merges next_idx into prev_idx if possible,
+ * updates both prev_idx and next_idx leaving any
+ * portion that could not be merged in next_idx */
+static int unifyfs_coalesce_index(
+    unifyfs_index_t* prev_idx, /* existing index entry to coalesce into */
+    unifyfs_index_t* next_idx, /* new index entry we'd like to add */
+    long slice_size)           /* byte size of slice of key-value store */
 {
-
-    long cur_idx_start = cur_idx->file_pos;
-    long cur_idx_end = cur_idx->file_pos + cur_idx->length - 1;
-
-    long cur_slice_start = cur_idx->file_pos / slice_range * slice_range;
-    long cur_slice_end = cur_slice_start + slice_range - 1;
-
-
-    index_set->count = 0;
-
-    long cur_mem_pos = cur_idx->mem_pos;
-    if (cur_idx_end <= cur_slice_end) {
-        /*
-        cur_slice_start                                  cur_slice_end
-                         cur_idx_start      cur_idx_end
-
-        */
-        index_set->idxes[index_set->count] = *cur_idx;
-        index_set->count++;
-
-    } else {
-        /*
-        cur_slice_start                     cur_slice_endnext_slice_start                   next_slice_end
-                         cur_idx_start                                      cur_idx_end
-
-        */
-        index_set->idxes[index_set->count] = *cur_idx;
-        index_set->idxes[index_set->count].length =
-            cur_slice_end - cur_idx_start + 1;
-
-        cur_mem_pos += index_set->idxes[index_set->count].length;
-
-        cur_slice_start = cur_slice_end + 1;
-        cur_slice_end = cur_slice_start + slice_range - 1;
-        index_set->count++;
-
-        while (1) {
-            if (cur_idx_end <= cur_slice_end) {
-                break;
-            }
-
-            index_set->idxes[index_set->count].fid = cur_idx->fid;
-            index_set->idxes[index_set->count].file_pos = cur_slice_start;
-            index_set->idxes[index_set->count].length = slice_range;
-            index_set->idxes[index_set->count].mem_pos = cur_mem_pos;
-            cur_mem_pos += index_set->idxes[index_set->count].length;
-
-            cur_slice_start = cur_slice_end + 1;
-            cur_slice_end = cur_slice_start + slice_range - 1;
-            index_set->count++;
-
-        }
-
-        index_set->idxes[index_set->count].fid = cur_idx->fid;
-        index_set->idxes[index_set->count].file_pos = cur_slice_start;
-        index_set->idxes[index_set->count].length = cur_idx_end - cur_slice_start + 1;
-        index_set->idxes[index_set->count].mem_pos = cur_mem_pos;
-        index_set->count++;
+    /* check whether last index and next index refer to same file */
+    if (prev_idx->gfid != next_idx->gfid) {
+        /* two index values are for different files, can't combine */
+        return UNIFYFS_SUCCESS;
     }
 
-    return 0;
+    /* got same file,
+     * check whether last index and next index refer to
+     * contiguous bytes */
+    off_t prev_offset = prev_idx->file_pos + prev_idx->length;
+    off_t next_offset = next_idx->file_pos;
+    if (prev_offset != next_offset) {
+        /* index values are not contiguous, can't combine */
+        return UNIFYFS_SUCCESS;
+    }
+
+    /* got contiguous bytes in the same file,
+     * check whether both index values fall in the same slice */
+    off_t prev_slice = prev_idx->file_pos / slice_size;
+    off_t next_slice = next_idx->file_pos / slice_size;
+    if (prev_slice != next_slice) {
+        /* index values refer to different slices, can't combine */
+        return UNIFYFS_SUCCESS;
+    }
+
+    /* check whether last index and next index refer to
+     * contiguous bytes in the log */
+    off_t prev_log = prev_idx->log_pos + prev_idx->length;
+    off_t next_log = next_idx->log_pos;
+    if (prev_log != next_log) {
+        /* index values are not contiguous in log, can't combine */
+        return UNIFYFS_SUCCESS;
+    }
+
+    /* if we get here, we can coalesce next index value into previous */
+
+    /* get ending offset of write in next index,
+     * and ending offset of current slice */
+    off_t next_end  = next_idx->file_pos + next_idx->length;
+    off_t slice_end = (next_slice * slice_size) + slice_size;
+
+    /* determine number of bytes in next index that lie in current slice,
+     * assume all bytes in the index will fit */
+    long length = next_idx->length;
+    if (next_end > slice_end) {
+        /* current index writes beyond end of slice,
+         * so we can only coalesce bytes that fall within slice */
+        length = slice_end - next_offset;
+    }
+
+    /* extend length of last index to include beginning portion
+     * of current index */
+    prev_idx->length += length;
+
+    /* adjust current index to subtract off those bytes */
+    next_idx->file_pos += length;
+    next_idx->log_pos  += length;
+    next_idx->length   -= length;
+
+    return UNIFYFS_SUCCESS;
 }
 
-/* read data from specified chunk id, chunk offset, and count into user buffer,
+/*
+ * Clear all entries in the log index.  This only clears the metadata,
+ * not the data itself.
+ */
+static void unifyfs_clear_index(void)
+{
+    *unifyfs_indices.ptr_num_entries = 0;
+}
+
+/*
+ * Sync all the extents to the server.  Clears the metadata index afterwards.
+ *
+ * Returns 0 on success, nonzero otherwise.
+ */
+int unifyfs_sync(int gfid)
+{
+    /* write contents from segment tree to index buffer
+     * if we're using that optimization */
+    if (unifyfs_flatten_writes) {
+        unifyfs_rewrite_index_from_seg_tree();
+    }
+
+    /* if there are no index entries, we've got nothing to sync */
+    if (*unifyfs_indices.ptr_num_entries == 0) {
+        return UNIFYFS_SUCCESS;
+    }
+
+    /* ensure any data written to the spill over file is flushed */
+    /* if using spill over, fsync spillover data to disk */
+    if (unifyfs_use_spillover) {
+        int ret = __real_fsync(unifyfs_spilloverblock);
+        if (ret != 0) {
+            /* error, need to set errno appropriately,
+             * we called the real fsync which should
+             * have already set errno to something reasonable */
+            LOGERR("failed to flush data to spill over file");
+            return UNIFYFS_ERROR_IO;
+        }
+    }
+
+    /* tell the server to grab our new extents */
+    int ret = invoke_client_fsync_rpc(gfid);
+    if (ret != UNIFYFS_SUCCESS) {
+        /* something went wrong when trying to flush key/values */
+        LOGERR("failed to flush key/value index to server");
+        return UNIFYFS_ERROR_IO;
+    }
+
+    /* flushed, clear buffer and refresh number of entries
+     * and number remaining */
+    unifyfs_clear_index();
+
+    return UNIFYFS_SUCCESS;
+}
+
+void unifyfs_add_index_entry_to_seg_tree(
+    unifyfs_filemeta_t* meta,
+    unifyfs_index_t* index)
+{
+    /* add index to our local log */
+    if (unifyfs_local_extents) {
+        seg_tree_add(&meta->extents, index->file_pos,
+            index->file_pos + index->length - 1,
+            index->log_pos);
+    }
+
+    if (!unifyfs_flatten_writes) {
+        /* We're not flattening writes.  Nothing to do */
+        return;
+    }
+
+    /* to update the global running segment count, we need to capture
+     * the count in this tree before adding and the count after to
+     * add the difference */
+    unsigned long count_before = seg_tree_count(&meta->extents_sync);
+
+    /*
+     * Store the write in our segment tree.  We will later use this for
+     * flattening writes.
+     */
+    seg_tree_add(&meta->extents_sync, index->file_pos,
+        index->file_pos + index->length - 1,
+        index->log_pos);
+
+    /*
+     * We want to make sure the next write following this wont overflow the
+     * max number of index entries (if it were synced).  A write can at most
+     * create two new nodes in the seg_tree.  If we're close to potentially
+     * filling up the index, sync it out.
+     */
+    if (unifyfs_segment_count >= (unifyfs_max_index_entries - 2)) {
+        /* this will flush our segments, sync them, and set the running
+         * segment count back to 0 */
+        unifyfs_sync(meta->gfid);
+    } else {
+        /* increase the running global segment count by the number of
+         * new entries we added to this tree */
+        unsigned long count_after = seg_tree_count(&meta->extents_sync);
+        unifyfs_segment_count += (count_after - count_before);
+    }
+}
+
+/* Add the metadata for a single write to the index */
+static int unifyfs_logio_add_write_meta_to_index(unifyfs_filemeta_t* meta,
+    off_t file_pos, off_t log_pos, size_t length)
+{
+    /* global file id for this entry */
+    int gfid = meta->gfid;
+
+    /* define an new index entry for this write operation */
+    unifyfs_index_t cur_idx;
+    cur_idx.gfid     = gfid;
+    cur_idx.file_pos = file_pos;
+    cur_idx.log_pos  = log_pos;
+    cur_idx.length   = length;
+
+    /* lookup number of existing index entries */
+    off_t num_entries = *(unifyfs_indices.ptr_num_entries);
+
+    /* get pointer to index array */
+    unifyfs_index_t* idxs = unifyfs_indices.index_entry;
+
+    /* attempt to coalesce contiguous index entries if we
+     * have an existing index in the buffer */
+    if (num_entries > 0) {
+        /* get pointer to last element in index array */
+        unifyfs_index_t* prev_idx = &idxs[num_entries - 1];
+
+        /* attempt to coalesce current index with last index,
+         * updates fields in last index and current index
+         * accordingly */
+        unifyfs_coalesce_index(prev_idx, &cur_idx,
+            unifyfs_key_slice_range);
+        if (cur_idx.length == 0) {
+            /* We were able to coalesce this write into prev_idx */
+            unifyfs_add_index_entry_to_seg_tree(meta, prev_idx);
+        }
+    }
+
+    /* add new index entry if needed */
+    if (cur_idx.length > 0) {
+        /* remaining entries we can fit in the shared memory region */
+        off_t remaining_entries = unifyfs_max_index_entries - num_entries;
+
+        /* if we have filled the key/value buffer, flush it to server */
+        if (0 == remaining_entries) {
+            /* index buffer is full, flush it */
+            int ret = unifyfs_sync(cur_idx.gfid);
+            if (ret != UNIFYFS_SUCCESS) {
+                /* something went wrong when trying to flush key/values */
+                LOGERR("failed to flush key/value index to server");
+                return UNIFYFS_ERROR_IO;
+            }
+        }
+
+        /* copy entry into index buffer */
+        idxs[num_entries] = cur_idx;
+
+        /* Add index entry to our seg_tree */
+        unifyfs_add_index_entry_to_seg_tree(meta, &idxs[num_entries]);
+
+        /* account for entries we just added */
+        num_entries += 1;
+
+        /* update number of entries in index array */
+        (*unifyfs_indices.ptr_num_entries) = num_entries;
+    }
+
+    return UNIFYFS_SUCCESS;
+}
+
+/* write count bytes from user buffer into specified chunk id at chunk offset,
  * count should fit within chunk starting from specified offset */
 static int unifyfs_logio_chunk_write(
     int fid,                  /* local file id */
@@ -348,134 +522,131 @@ static int unifyfs_logio_chunk_write(
     /* get chunk meta data */
     unifyfs_chunkmeta_t* chunk_meta = filemeta_get_chunkmeta(meta, chunk_id);
 
+    /* sanity check on the chunk type */
     if (chunk_meta->location != CHUNK_LOCATION_MEMFS &&
-            chunk_meta->location != CHUNK_LOCATION_SPILLOVER) {
+        chunk_meta->location != CHUNK_LOCATION_SPILLOVER) {
         /* unknown chunk type */
         LOGERR("unknown chunk type");
         return UNIFYFS_ERROR_IO;
     }
 
-    /* determine location of chunk */
+    /* copy data into chunk and record its starting offset within the log */
     off_t log_offset = 0;
     if (chunk_meta->location == CHUNK_LOCATION_MEMFS) {
-        /* just need a memcpy to write data */
+        /* store data in shared memory chunk,
+         * compute address to copy data to */
         char* chunk_buf = unifyfs_compute_chunk_buf(
             meta, chunk_id, chunk_offset);
+
+        /* just need a memcpy to record data */
         memcpy(chunk_buf, buf, count);
 
+        /* record byte offset position within log, which is the number
+         * of bytes between the memory location we write to and the
+         * starting memory location of the shared memory data chunk region */
         log_offset = chunk_buf - unifyfs_chunks;
     } else if (chunk_meta->location == CHUNK_LOCATION_SPILLOVER) {
-        /* spill over to a file, so write to file descriptor */
-        //MAP_OR_FAIL(pwrite);
+        /* spill over to a file, so write to file descriptor,
+         * compute offset within spill over file */
         off_t spill_offset = unifyfs_compute_spill_offset(meta, chunk_id, chunk_offset);
-        ssize_t rc = __real_pwrite(unifyfs_spilloverblock, buf, count, spill_offset);
-        if (rc < 0)  {
-            LOGERR("pwrite failed: errno=%d (%s)", errno, strerror(errno));
+
+        /* write data into file at appropriate offset,
+         * loop to keep trying short writes */
+        //MAP_OR_FAIL(pwrite);
+        size_t nwritten = 0;
+        while (nwritten < count) {
+            /* attempt to write */
+            void* bufpos = (void*)((char*)buf + nwritten);
+            size_t remaining = count - nwritten;
+            off_t filepos = spill_offset + (off_t)nwritten;
+            errno = 0;
+            ssize_t rc = __real_pwrite(unifyfs_spilloverblock,
+                bufpos, remaining, filepos);
+            if (rc < 0)  {
+                LOGERR("pwrite failed: errno=%d (%s)", errno, strerror(errno));
+                return UNIFYFS_ERROR_IO;
+            }
+
+            /* wrote without an error, total up bytes written so far */
+            nwritten += (size_t)rc;
         }
 
+        /* record byte offset position within log, for spill over
+         * locations we take the offset within the spill file
+         * added to the total size of all shared memory data chunks */
         log_offset = spill_offset + unifyfs_max_chunks * (1 << unifyfs_chunk_bits);
     }
 
-    /* find the corresponding file attr entry and update attr*/
-    unifyfs_file_attr_t tmp_meta_entry;
-    tmp_meta_entry.fid = fid;
-    unifyfs_file_attr_t* ptr_meta_entry
-        = (unifyfs_file_attr_t*)bsearch(&tmp_meta_entry,
-                                        unifyfs_fattrs.meta_entry,
-                                        *unifyfs_fattrs.ptr_num_entries,
-                                        sizeof(unifyfs_file_attr_t),
-                                        compare_fattr);
-    if (ptr_meta_entry !=  NULL) {
-        ptr_meta_entry->size = pos + count;
-    }
+    /* get global file id for this file */
+    int gfid = unifyfs_gfid_from_fid(fid);
 
-    /* define an new index entry for this write operation */
-    unifyfs_index_t cur_idx;
-    cur_idx.fid      = ptr_meta_entry->gfid;
-    cur_idx.file_pos = pos;
-    cur_idx.mem_pos  = log_offset;
-    cur_idx.length   = count;
-
-    /* split the write requests larger than unifyfs_key_slice_range into
-     * the ones smaller than unifyfs_key_slice_range
-     * */
-    index_set_t tmp_index_set;
-    memset(&tmp_index_set, 0, sizeof(tmp_index_set));
-    unifyfs_split_index(&cur_idx, &tmp_index_set,
-                        unifyfs_key_slice_range);
-
-    /* lookup number of existing index entries */
-    off_t num_entries = *(unifyfs_indices.ptr_num_entries);
-
-    /* number of new entries we may add */
-    off_t tmp_entries = (off_t) tmp_index_set.count;
-
-    /* check whether there is room to add new entries */
-    if (num_entries + tmp_entries < unifyfs_max_index_entries) {
-        /* get pointer to index array */
-        unifyfs_index_t* idxs = unifyfs_indices.index_entry;
-
-        /* coalesce contiguous indices */
-        int i = 0;
-        if (num_entries > 0) {
-            /* pointer to last element in index array */
-            unifyfs_index_t* prev_idx = &idxs[num_entries - 1];
-
-            /* pointer to first element in temp list */
-            unifyfs_index_t* next_idx = &tmp_index_set.idxes[0];
-
-            /* offset of last byte for last index in list */
-            off_t prev_offset = prev_idx->file_pos + prev_idx->length;
-
-            /* check whether last index and temp index refer to
-             * contiguous bytes in the same file */
-            if (prev_idx->fid == next_idx->fid &&
-                    prev_offset   == next_idx->file_pos) {
-                /* got contiguous bytes in the same file,
-                 * check if both index values fall in the same slice */
-                off_t prev_slice = prev_idx->file_pos / unifyfs_key_slice_range;
-                off_t next_slice = next_idx->file_pos / unifyfs_key_slice_range;
-                if (prev_slice == next_slice) {
-                    /* index values also are in same slice,
-                     * so append first index in temp list to
-                     * last index in list */
-                    prev_idx->length  += next_idx->length;
-
-                    /* advance to next index in temp list */
-                    i++;
-                }
-            }
-        }
-
-        /* pointer to temp index list */
-        unifyfs_index_t* newidxs = tmp_index_set.idxes;
-
-        /* copy remaining items in temp index list to index list */
-        while (i < tmp_index_set.count) {
-            /* copy index fields */
-            idxs[num_entries].fid      = newidxs[i].fid;
-            idxs[num_entries].file_pos = newidxs[i].file_pos;
-            idxs[num_entries].mem_pos  = newidxs[i].mem_pos;
-            idxs[num_entries].length   = newidxs[i].length;
-
-            /* advance to next element in each list */
-            num_entries++;
-            i++;
-        }
-
-        /* update number of entries in index array */
-        (*unifyfs_indices.ptr_num_entries) = num_entries;
-    } else {
-        /* TODO: no room to write additional index metadata entries,
-         * swap out existing metadata buffer to disk*/
-        printf("exhausted metadata");
-    }
-
-    /* assume read was successful if we get to here */
-    return UNIFYFS_SUCCESS;
+    /* Update our write metadata with the new write */
+    int rc = unifyfs_logio_add_write_meta_to_index(meta, pos, log_offset,
+        count);
+    return rc;
 }
 
-/* read data from specified chunk id, chunk offset, and count into user buffer,
+/*
+ * Remove all entries in the current index and re-write it using the write
+ * metadata stored in all the file's seg_trees.  This only re-writes the
+ * metadata in the index.  All the actual data is still kept in the log and
+ * will be referenced correctly by the new metadata.
+ *
+ * After this function is done 'unifyfs_indices' will have been totally
+ * re-written.  The writes in the index will be flattened, non-overlapping,
+ * and sequential, for each file, one after another.  All seg_trees will be
+ * cleared.
+ *
+ * This function is called when we sync our extents.
+ */
+void unifyfs_rewrite_index_from_seg_tree(void)
+{
+    /* get pointer to index buffer */
+    unifyfs_index_t* indexes = unifyfs_indices.index_entry;
+
+    /* Erase the index before we re-write it */
+    unifyfs_clear_index();
+
+    /* count up number of entries we wrote to buffer */
+    unsigned long idx = 0;
+
+    /* For each fid .. */
+    for (int i = 0; i < UNIFYFS_MAX_FILEDESCS; i++) {
+        /* get file id for each file descriptor */
+        int fid = unifyfs_fds[i].fid;
+        unifyfs_filemeta_t* meta = unifyfs_get_meta_from_fid(fid);
+        if (!meta) {
+            continue;
+        }
+
+        int gfid = unifyfs_gfid_from_fid(fid);
+
+        seg_tree_rdlock(&meta->extents_sync);
+
+        /* For each write in this file's seg_tree ... */
+        struct seg_tree_node* node = NULL;
+        while ((node = seg_tree_iter(&meta->extents_sync, node))) {
+            indexes[idx].file_pos = node->start;
+            indexes[idx].log_pos  = node->ptr;
+            indexes[idx].length   = node->end - node->start + 1;
+            indexes[idx].gfid     = gfid;
+            idx++;
+        }
+
+        seg_tree_unlock(&meta->extents_sync);
+
+        /* All done processing this files writes.  Clear its seg_tree */
+        seg_tree_clear(&meta->extents_sync);
+    }
+
+    /* reset our segment count since we just dumped them all */
+    unifyfs_segment_count = 0;
+
+    /* record total number of entries in index buffer */
+    *unifyfs_indices.ptr_num_entries = idx;
+}
+
+/* write count bytes from user buffer into specified chunk id at chunk offset,
  * count should fit within chunk starting from specified offset */
 static int unifyfs_chunk_write(
     unifyfs_filemeta_t* meta, /* pointer to file meta data */
@@ -511,7 +682,7 @@ static int unifyfs_chunk_write(
         return UNIFYFS_ERROR_IO;
     }
 
-    /* assume read was successful if we get to here */
+    /* assume write was successful if we get to here */
     return UNIFYFS_SUCCESS;
 }
 
@@ -529,14 +700,10 @@ int unifyfs_fid_store_fixed_extend(int fid, unifyfs_filemeta_t* meta,
         /* compute number of additional bytes we need */
         off_t additional = length - maxsize;
         while (additional > 0) {
-            /* check that we don't overrun max number of chunks for file */
-            if (meta->chunks == unifyfs_max_chunks + unifyfs_spillover_max_chunks) {
-                return UNIFYFS_ERROR_NOSPC;
-            }
-
             /* allocate a new chunk */
             int rc = unifyfs_chunk_alloc(fid, meta, meta->chunks);
             if (rc != UNIFYFS_SUCCESS) {
+                /* ran out of space to store data */
                 LOGERR("failed to allocate chunk");
                 return UNIFYFS_ERROR_NOSPC;
             }
@@ -625,12 +792,9 @@ int unifyfs_fid_store_fixed_write(int fid, unifyfs_filemeta_t* meta, off_t pos,
     int chunk_id;
     off_t chunk_offset;
 
-    if (meta->storage == FILE_STORAGE_FIXED_CHUNK) {
-        chunk_id = pos >> unifyfs_chunk_bits;
-        chunk_offset = pos & unifyfs_chunk_mask;
-    } else if (meta->storage == FILE_STORAGE_LOGIO) {
-        chunk_id = meta->size >> unifyfs_chunk_bits;
-        chunk_offset = meta->size & unifyfs_chunk_mask;
+    if (meta->storage == FILE_STORAGE_LOGIO) {
+        chunk_id = meta->log_size >> unifyfs_chunk_bits;
+        chunk_offset = meta->log_size & unifyfs_chunk_mask;
     } else {
         return UNIFYFS_ERROR_IO;
     }
@@ -639,9 +803,7 @@ int unifyfs_fid_store_fixed_write(int fid, unifyfs_filemeta_t* meta, off_t pos,
     size_t remaining = unifyfs_chunk_size - chunk_offset;
     if (count <= remaining) {
         /* all bytes for this write fit within the current chunk */
-        if (meta->storage == FILE_STORAGE_FIXED_CHUNK) {
-            rc = unifyfs_chunk_write(meta, chunk_id, chunk_offset, buf, count);
-        } else if (meta->storage == FILE_STORAGE_LOGIO) {
+        if (meta->storage == FILE_STORAGE_LOGIO) {
             rc = unifyfs_logio_chunk_write(fid, pos, meta, chunk_id, chunk_offset,
                                            buf, count);
         } else {
@@ -650,10 +812,7 @@ int unifyfs_fid_store_fixed_write(int fid, unifyfs_filemeta_t* meta, off_t pos,
     } else {
         /* otherwise, fill up the remainder of the current chunk */
         char* ptr = (char*) buf;
-        if (meta->storage == FILE_STORAGE_FIXED_CHUNK) {
-            rc = unifyfs_chunk_write(meta, chunk_id,
-                chunk_offset, (void*)ptr, remaining);
-        } else if (meta->storage == FILE_STORAGE_LOGIO) {
+        if (meta->storage == FILE_STORAGE_LOGIO) {
             rc = unifyfs_logio_chunk_write(fid, pos, meta, chunk_id,
                 chunk_offset, (void*)ptr, remaining);
         } else {
@@ -677,9 +836,7 @@ int unifyfs_fid_store_fixed_write(int fid, unifyfs_filemeta_t* meta, off_t pos,
             }
 
             /* write data */
-            if (meta->storage == FILE_STORAGE_FIXED_CHUNK) {
-                rc = unifyfs_chunk_write(meta, chunk_id, 0, (void*)ptr, num);
-            } else if (meta->storage == FILE_STORAGE_LOGIO) {
+            if (meta->storage == FILE_STORAGE_LOGIO) {
                 rc = unifyfs_logio_chunk_write(fid, pos, meta, chunk_id, 0,
                                                (void*)ptr, num);
             } else {

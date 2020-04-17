@@ -57,18 +57,16 @@
 #define RECV_BUF_CNT 4               /* number of remote read buffers */
 #define SENDRECV_BUF_LEN (8 * MIB)   /* remote read buffer size */
 #define MAX_META_PER_SEND (4 * KIB)  /* max read request count per server */
-#define REQ_BUF_LEN (MAX_META_PER_SEND * 128) /* read requests (send_msg_t) */
+#define REQ_BUF_LEN (MAX_META_PER_SEND * 64) /* chunk read reqs buffer size */
 #define SHM_WAIT_INTERVAL 1000       /* unit: ns */
 #define RM_MAX_ACTIVE_REQUESTS 64    /* number of concurrent read requests */
 
 // Service Manager
 #define LARGE_BURSTY_DATA (512 * MIB)
 #define MAX_BURSTY_INTERVAL 10000 /* unit: us */
-#define MIN_SLEEP_INTERVAL 10     /* unit: us */
+#define MIN_SLEEP_INTERVAL 100    /* unit: us */
 #define SLEEP_INTERVAL 500        /* unit: us */
 #define SLEEP_SLICE_PER_UNIT 50   /* unit: us */
-#define READ_BLOCK_SIZE MIB
-#define READ_BUF_SZ GIB
 
 // Request and Service Managers, Command Handler
 #define MAX_NUM_CLIENTS 64 /* app processes per server */
@@ -84,13 +82,12 @@
 #define UNIFYFS_CHUNK_MEM (256 * MIB)
 #define UNIFYFS_SPILLOVER_SIZE (KIB * MIB)
 #define UNIFYFS_SUPERBLOCK_KEY 4321
-#define UNIFYFS_SHMEM_REQ_SIZE (MIB*128 + 128*KIB)
-#define UNIFYFS_SHMEM_RECV_SIZE (MIB + 128*KIB)
+#define UNIFYFS_SHMEM_REQ_SIZE (8 * MIB)
+#define UNIFYFS_SHMEM_RECV_SIZE (32 * MIB)
 #define UNIFYFS_INDEX_BUF_SIZE  (20 * MIB)
-#define UNIFYFS_FATTR_BUF_SIZE MIB
 #define UNIFYFS_MAX_READ_CNT KIB
 
-/* max read size = UNIFYFS_MAX_SPLIT_CNT * META_DEFAULT_RANGE_SZ */
+/* NOTE: max read size = UNIFYFS_MAX_SPLIT_CNT * META_DEFAULT_RANGE_SZ */
 #define UNIFYFS_MAX_SPLIT_CNT (4 * KIB)
 
 // Metadata/MDHIM Default Values

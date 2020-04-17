@@ -70,14 +70,15 @@
     UNIFYFS_CFG_CLI(unifyfs, daemonize, BOOL, on, "enable server daemonization", NULL, 'D', "on|off") \
     UNIFYFS_CFG_CLI(unifyfs, mountpoint, STRING, /unifyfs, "mountpoint directory", NULL, 'm', "specify full path to desired mountpoint") \
     UNIFYFS_CFG(client, max_files, INT, UNIFYFS_MAX_FILES, "client max file count", NULL) \
+    UNIFYFS_CFG(client, flatten_writes, BOOL, on, "flatten writes", NULL) \
+    UNIFYFS_CFG(client, local_extents, BOOL, off, "track extents to service reads of local data", NULL) \
     UNIFYFS_CFG_CLI(log, verbosity, INT, 0, "log verbosity level", NULL, 'v', "specify logging verbosity level") \
     UNIFYFS_CFG_CLI(log, file, STRING, unifyfsd.log, "log file name", NULL, 'l', "specify log file name") \
     UNIFYFS_CFG_CLI(log, dir, STRING, LOGDIR, "log file directory", configurator_directory_check, 'L', "specify full path to directory to contain log file") \
     UNIFYFS_CFG(logfs, index_buf_size, INT, UNIFYFS_INDEX_BUF_SIZE, "log file system index buffer size", NULL) \
-    UNIFYFS_CFG(logfs, attr_buf_size, INT, UNIFYFS_FATTR_BUF_SIZE, "log file system file attributes buffer size", NULL) \
     UNIFYFS_CFG(margo, tcp, BOOL, on, "use TCP for server-server margo RPCs", NULL) \
     UNIFYFS_CFG(meta, db_name, STRING, META_DEFAULT_DB_NAME, "metadata database name", NULL) \
-    UNIFYFS_CFG(meta, db_path, STRING, /tmp, "metadata database path", NULL) \
+    UNIFYFS_CFG(meta, db_path, STRING, RUNDIR, "metadata database path", configurator_directory_check) \
     UNIFYFS_CFG(meta, server_ratio, INT, META_DEFAULT_SERVER_RATIO, "metadata server ratio", NULL) \
     UNIFYFS_CFG(meta, range_size, INT, META_DEFAULT_RANGE_SZ, "metadata range size", NULL) \
     UNIFYFS_CFG_CLI(runstate, dir, STRING, RUNDIR, "runstate file directory", configurator_directory_check, 'R', "specify full path to directory to contain server runstate file") \

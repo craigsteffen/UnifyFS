@@ -10,9 +10,11 @@ TESTS = \
 	0500-sysio-static.t \
 	0600-stdio-static.t \
 	9005-unifyfs-unmount.t \
+	9006-seg-tree-test.t \
 	9010-stop-unifyfsd.t \
 	9020-mountpoint-empty.t \
-	9100-metadata-api.t
+	9100-metadata-api.t \
+	9999-cleanup.t
 
 check_SCRIPTS = \
 	0001-setup.t \
@@ -21,9 +23,11 @@ check_SCRIPTS = \
 	0500-sysio-static.t \
 	0600-stdio-static.t \
 	9005-unifyfs-unmount.t \
+	9006-seg-tree-test.t \
 	9010-stop-unifyfsd.t \
 	9020-mountpoint-empty.t \
-	9100-metadata-api.t
+	9100-metadata-api.t \
+	9999-cleanup.t
 
 EXTRA_DIST = \
 	$(check_SCRIPTS) \
@@ -42,7 +46,9 @@ libexec_PROGRAMS = \
 	sys/sysio-static.t \
 	std/stdio-static.t \
 	server/metadata.t \
-	unifyfs_unmount.t
+	unifyfs_unmount.t \
+	seg_tree_test.t
+
 
 test_ldadd = \
 	$(top_builddir)/t/lib/libtap.la \
@@ -97,7 +103,12 @@ sys_sysio_gotcha_t_SOURCES = sys/sysio_suite.h \
                              sys/creat64.c \
                              sys/mkdir-rmdir.c \
                              sys/open.c \
-                             sys/open64.c
+                             sys/open64.c \
+                             sys/write-read.c \
+                             sys/write-read-hole.c \
+                             sys/truncate.c \
+                             sys/unlink.c
+
 sys_sysio_gotcha_t_CPPFLAGS = $(test_cppflags)
 sys_sysio_gotcha_t_LDADD = $(test_ldadd)
 sys_sysio_gotcha_t_LDFLAGS = $(AM_LDFLAGS)
@@ -108,21 +119,34 @@ sys_sysio_static_t_SOURCES = sys/sysio_suite.h \
                              sys/creat64.c \
                              sys/mkdir-rmdir.c \
                              sys/open.c \
-                             sys/open64.c
+                             sys/open64.c \
+                             sys/write-read.c \
+                             sys/write-read-hole.c \
+                             sys/truncate.c \
+                             sys/unlink.c
+
 sys_sysio_static_t_CPPFLAGS = $(test_cppflags)
 sys_sysio_static_t_LDADD = $(test_static_ldadd)
 sys_sysio_static_t_LDFLAGS = $(test_static_ldflags)
 
 std_stdio_gotcha_t_SOURCES = std/stdio_suite.h \
                              std/stdio_suite.c \
-                             std/fopen-fclose.c
+                             std/fopen-fclose.c \
+                             std/fwrite-fread.c \
+                             std/fflush.c \
+                             std/size.c
+
 std_stdio_gotcha_t_CPPFLAGS = $(test_cppflags)
 std_stdio_gotcha_t_LDADD = $(test_ldadd)
 std_stdio_gotcha_t_LDFLAGS = $(AM_LDFLAGS)
 
 std_stdio_static_t_SOURCES = std/stdio_suite.h \
                              std/stdio_suite.c \
-                             std/fopen-fclose.c
+                             std/fopen-fclose.c \
+                             std/fwrite-fread.c \
+                             std/fflush.c \
+                             std/size.c
+
 std_stdio_static_t_CPPFLAGS = $(test_cppflags)
 std_stdio_static_t_LDADD = $(test_static_ldadd)
 std_stdio_static_t_LDFLAGS = $(test_static_ldflags)
@@ -138,5 +162,10 @@ server_metadata_t_LDFLAGS = $(AM_LDFLAGS)
 
 unifyfs_unmount_t_SOURCES = unifyfs_unmount.c
 unifyfs_unmount_t_CPPFLAGS = $(test_cppflags)
-unifyfs_unmount_t_LDADD = $(test_ldadd)
-unifyfs_unmount_t_LDFLAGS = $(AM_LDFLAGS)
+unifyfs_unmount_t_LDADD = $(test_static_ldadd)
+unifyfs_unmount_t_LDFLAGS = $(test_static_ldflags)
+
+seg_tree_test_t_SOURCES = seg_tree_test.c
+seg_tree_test_t_CPPFLAGS = $(test_cppflags)
+seg_tree_test_t_LDADD = $(test_static_ldadd)
+seg_tree_test_t_LDFLAGS = $(test_static_ldflags)

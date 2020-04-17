@@ -16,6 +16,51 @@ In this section, we describe how to build UnifyFS with I/O interception.
 
 .. _build-label:
 
+---------------------------------------
+UnifyFS Build Configuration Options
+---------------------------------------
+
+Fortran
+*******
+
+To enable UnifyFS use with Fortran applications, pass the ``--enable-fortran``
+option to configure. Note that only GCC Fortran (i.e., gfortran) is known to
+work with UnifyFS.
+
+GOTCHA
+******
+
+GOTCHA is the preferred method for I/O interception with UnifyFS, but it is not
+available on all platforms. If GOTCHA is not available on your target system,
+you can omit it during UnifyFS configuration by using the ``--without-gotcha``
+configure option. Without GOTCHA, static linker wrapping is required for I/O
+interception.
+
+PMI2/PMIx Key-Value Store
+*************************
+
+When available, UnifyFS uses the distributed key-value store capabilities
+provided by either PMI2 or PMIx. To enable this support, pass either
+the ``--enable-pmi`` or ``--enable-pmix`` option to configure. Without
+PMI support, a distributed file system accessible to all servers is required.
+
+Transparent Mounting for MPI Applications
+*****************************************
+
+MPI applications written in C or C++ may take advantage of the UnifyFS transparent
+mounting capability. With transparent mounting, calls to ``unifyfs_mount()`` and
+``unifyfs_unmount()`` are automatically performed during ``MPI_Init()`` and
+``MPI_Finalize()``, respectively. Transparent mounting always uses ``/unifyfs`` as
+the namespace mountpoint. To enable transparent mounting, use the
+``--enable-mpi-mount`` configure option.
+
+HDF5
+****
+
+UnifyFS includes example programs that use HDF5. If HDF5 is not available on
+your target system, it can be omitted during UnifyFS configuration by using
+the ``--without-hdf5`` configure option.
+
 ---------------------------
 How to Build UnifyFS
 ---------------------------
@@ -29,11 +74,10 @@ Building with Spack
 ********************
 
 These instructions assume that you do not already have a module system installed
-such as LMod, Dotkit, or Environment Modules. If your system already has Dotkit
-or LMod installed then installing the environment-modules package with Spack
+such as LMod or Environment Modules. If your system already has
+LMod installed then installing the environment-modules package with Spack
 is unnecessary (so you can safely skip that step).
 
-If you use Dotkit then replace ``spack load`` with ``spack use``.
 First, install Spack if you don't already have it:
 
 .. code-block:: Bash
@@ -62,18 +106,17 @@ build is desired. Type ``spack info unifyfs`` for more info.
 .. table:: UnifyFS Build Variants
    :widths: auto
 
-   =======  ========================================  =========================
+   =======  ========================================  ===========================
    Variant  Command                                   Description
-   =======  ========================================  =========================
+   =======  ========================================  ===========================
    HDF5     ``spack install unifyfs+hdf5``            Build with parallel HDF5
 
             ``spack install unifyfs+hdf5 ^hdf5~mpi``  Build with serial HDF5
-   Fortran  ``spack install unifyfs+fortran``         Build with gfortran
-   NUMA     ``spack install unifyfs+numa``            Build with NUMA
-   pmpi     ``spack install unifyfs+pmpi``            Transparent mount/unmount
-   PMI      ``spack install unifyfs+pmi``             Enable PMI2 build options
-   PMIx     ``spack install unifyfs+pmix``            Enable PMIx build options
-   =======  ========================================  =========================
+   Fortran  ``spack install unifyfs+fortran``         Enable Fortran support
+   PMI      ``spack install unifyfs+pmi``             Enable PMI2 support
+   PMIx     ``spack install unifyfs+pmix``            Enable PMIx support
+   PMPI     ``spack install unifyfs+pmpi``            Enable transparent mounting
+   =======  ========================================  ===========================
 
 .. attention::
 
@@ -107,8 +150,6 @@ Build the Dependencies with Spack
 
 Once Spack is installed on your system (see :ref:`above <build-label>`), you
 can install just the dependencies for an easier manual installation of UnifyFS.
-
-If you use Dotkit then replace ``spack load`` with ``spack use``.
 
 .. code-block:: Bash
 
@@ -163,9 +204,8 @@ Build the Dependencies without Spack
 """""""""""""""""""""""""""""""""""""
 
 For users who cannot use Spack, a `bootstrap.sh <https://github.com/LLNL/UnifyFS/blob/dev/bootstrap.sh>`_
-script has been provided in order to make manual installation of dependencies
-easier. Simply run this script in the desired directory for the dependencies to
-be installed.
+script has been provided in order to make manual build and installation of
+dependencies easier. Simply run the script in the top level directory of the source code.
 
 .. code-block:: Bash
 
@@ -173,7 +213,10 @@ be installed.
 
 References to the UnifyFS dependencies can be found :doc:`here <dependencies>`.
 
-Then to build UnifyFS:
+
+After bootstrap.sh is finished building the dependencies, it will print out the
+commands you need to run to build UnifyFS.  The commands look something like
+this:
 
 .. code-block:: Bash
 
@@ -182,17 +225,6 @@ Then to build UnifyFS:
     $ ./configure --prefix=/path/to/install --with-gotcha=/path/to/gotcha --with-leveldb=/path/to/leveldb  --with-flatcc=/path/to/flatcc
     $ make
     $ make install
-
-.. note::
-
-    You may need to add the following to your configure line if it is not in
-    your default path on a linux machine:
-
-    ``--with-numa=$PATH_TO_NUMA``
-
-    This is needed to enable NUMA-aware memory allocation on Linux machines. Set the
-    NUMA policy at runtime with ``UNIFYFS_NUMA_POLICY = local | interleaved``, or set
-    NUMA nodes explicitly with ``UNIFYFS_USE_NUMA_BANK = <node no.>``
 
 ---------------------------
 

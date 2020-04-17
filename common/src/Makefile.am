@@ -34,7 +34,10 @@ BASE_SRCS = \
   unifyfs_runstate.h \
   unifyfs_runstate.c \
   unifyfs_shm.h \
-  unifyfs_shm.c
+  unifyfs_shm.c \
+  tree.h \
+  seg_tree.h \
+  seg_tree.c
 
 OPT_FLAGS =
 OPT_LIBS =
@@ -58,6 +61,8 @@ libunifyfs_common_la_CPPFLAGS = \
   $(ARGOBOTS_CFLAGS) \
   $(MARGO_CFLAGS) \
   $(FLATCC_CFLAGS)
+
+libunifyfs_common_la_CPPFLAGS += -DSYSCONFDIR="$(sysconfdir)"
 
 libunifyfs_common_la_LDFLAGS = \
   -version-info $(LIBUNIFYFS_LT_VERSION)

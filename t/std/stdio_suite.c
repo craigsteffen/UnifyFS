@@ -70,6 +70,9 @@ int main(int argc, char* argv[])
      * failures to start passing. */
 
     fopen_fclose_test(unifyfs_root);
+    fwrite_fread_test(unifyfs_root);
+    fflush_test(unifyfs_root);
+    size_test(unifyfs_root);
 
     MPI_Finalize();
 
