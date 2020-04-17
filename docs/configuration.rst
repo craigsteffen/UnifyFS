@@ -14,6 +14,7 @@ certain settings have command line options. When defined via multiple methods,
 the command line options have the highest priority, followed by environment
 variables, and finally config file options from ``unifyfs.conf``.
 
+
 The system-wide configuration file is used by default when available.
 However, users can specify a custom location for the configuration file using
 the ``-f`` command-line option to ``unifyfsd`` (see below).
