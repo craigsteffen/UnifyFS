@@ -12,7 +12,7 @@ level design of UnifyFS. It will describe the UnifyFS library and the UnifyFS
 daemon.
 
 This is a new paragraph.  We will see if lines that are created with the GUI
-editor will have trailing white space problems.
+editor will have trailing white space problems.  blah.
 
 ---------------------------
 High Level Design
